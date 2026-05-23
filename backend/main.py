@@ -266,6 +266,8 @@ def generate_gemini_reply(
 ) -> str | None:
     api_key, model, _source = get_gemini_settings(user_id)
     if not api_key:
+        USER_GEMINI_ERRORS[user_id] = "GEMINI_API_KEY is not configured on the backend."
+        print("Gemini skipped: GEMINI_API_KEY is not configured on the backend.", flush=True)
         return None
 
     try:
@@ -275,7 +277,12 @@ def generate_gemini_reply(
             json=build_gemini_payload(username, content, history),
             timeout=20,
         )
-        response.raise_for_status()
+        if response.status_code >= 400:
+            error_text = response.text[:1000]
+            USER_GEMINI_ERRORS[user_id] = f"Gemini HTTP {response.status_code}: {error_text}"
+            print(f"Gemini HTTP {response.status_code}: {error_text}", flush=True)
+            return None
+
         data = response.json()
         candidates = data.get("candidates", [])
         parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
@@ -285,6 +292,11 @@ def generate_gemini_reply(
         return reply or None
     except requests.RequestException as exc:
         USER_GEMINI_ERRORS[user_id] = str(exc)
+        print(f"Gemini request failed: {exc}", flush=True)
+        return None
+    except ValueError as exc:
+        USER_GEMINI_ERRORS[user_id] = f"Gemini returned invalid JSON: {exc}"
+        print(f"Gemini returned invalid JSON: {exc}", flush=True)
         return None
 
 
