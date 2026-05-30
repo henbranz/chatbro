@@ -1,5 +1,6 @@
 .env
 .venv/
+.venv-macos/
 __pycache__/
 *.pyc
 messages.db

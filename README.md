@@ -1,19 +1,22 @@
 # Chat Bro
 
-Chat Bro is a Python chat MVP with a separated client-server architecture:
+Chat Bro הוא MVP לצ'אט מודרני עם Streamlit, FastAPI ו-SQLite.
+
+הארכיטקטורה נשארת מופרדת:
 
 ```text
 User -> Streamlit frontend -> FastAPI backend -> SQLite database
 ```
 
-The Streamlit frontend never reads or writes the database directly. It talks to the FastAPI backend only through HTTP requests with JSON payloads. The backend is the only layer that uses SQLite.
+ה-frontend אינו ניגש למסד הנתונים ישירות. כל הפעולות עוברות דרך HTTP JSON אל ה-backend, ורק FastAPI קורא וכותב ל-SQLite.
 
-## Project Structure
+המערכת כוללת הרשמה/התחברות, רשימת שיחות, בחירת שיחה, שליחת הודעות, רענון הודעות באמצעות polling, וחיפוש חופשי בתוכן ההודעות.
+
+## מבנה תיקיות
 
 ```text
 simplechat/
 ├── requirements.txt
-├── render.yaml
 ├── README.md
 ├── backend/
 │   ├── __init__.py
@@ -23,132 +26,167 @@ simplechat/
     └── app.py
 ```
 
-## Local Setup
+## יצירת סביבה וירטואלית
 
-Create a virtual environment:
+Mac/Linux:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+Windows PowerShell:
 
 ```powershell
 py -m venv .venv
 ```
 
-Install dependencies:
+אם PowerShell חוסם הפעלת scripts, אפשר להריץ את הפקודות דרך Python של הסביבה בלי להפעיל `Activate.ps1`.
+
+## התקנת תלויות
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-Create a local `.env` file from `.env.example` and set your Gemini key:
+## הרצה מקומית מהירה
 
-```text
-GEMINI_API_KEY=your-gemini-api-key
-GEMINI_MODEL=gemini-2.5-flash
-DATABASE_PATH=messages.db
-API_BASE_URL=http://127.0.0.1:8000
+אחרי התקנת התלויות, אפשר להריץ את ה-backend וה-frontend יחד מכל מערכת הפעלה:
+
+Mac/Linux:
+
+```bash
+python run_local.py
 ```
 
-Do not commit `.env` to GitHub.
+Windows PowerShell:
 
-## Run Locally
+```powershell
+.\.venv\Scripts\python.exe run_local.py
+```
 
-Start the backend:
+ברירת המחדל:
+
+```text
+Backend:  http://127.0.0.1:8000
+Frontend: http://127.0.0.1:8501
+```
+
+אם הפורטים תפוסים:
+
+Mac/Linux:
+
+```bash
+CHAT_BRO_BACKEND_PORT=8005 CHAT_BRO_FRONTEND_PORT=8505 python run_local.py
+```
+
+Windows PowerShell:
+
+```powershell
+$env:CHAT_BRO_BACKEND_PORT="8005"
+$env:CHAT_BRO_FRONTEND_PORT="8505"
+.\.venv\Scripts\python.exe run_local.py
+```
+
+## Gemini API
+
+אין להכניס מפתח API לקוד.
+
+ה-backend קורא את המפתח ממשתנה סביבה:
+
+```powershell
+$env:GEMINI_API_KEY="your-gemini-api-key"
+```
+
+אפשר להחליף מודל דרך:
+
+```powershell
+$env:GEMINI_MODEL="gemini-2.5-flash"
+```
+
+אם `GEMINI_API_KEY` לא מוגדר, Chat Bro משתמש בתשובות rule-based מקומיות.
+
+## הרצת ה-backend
 
 ```powershell
 .\.venv\Scripts\python.exe -m uvicorn backend.main:app --reload
 ```
 
-Start the frontend in a second terminal:
+ה-API ירוץ בכתובת:
+
+```text
+http://127.0.0.1:8000
+```
+
+## הרצת ה-frontend
+
+פתחו טרמינל נוסף:
 
 ```powershell
 .\.venv\Scripts\python.exe -m streamlit run frontend/app.py
 ```
 
-Open:
+ה-UI ירוץ בדרך כלל בכתובת:
 
 ```text
 http://localhost:8501
 ```
 
-## Database
+אם ה-backend רץ בפורט אחר, אפשר להגדיר ל-frontend את כתובת ה-API:
 
-By default, SQLite is stored in:
+```powershell
+$env:CHAT_BRO_API_BASE_URL="http://127.0.0.1:8003"
+```
+
+## בדיקה ידנית
+
+1. הפעילו את ה-backend.
+2. הפעילו את Streamlit.
+3. צרו משתמש חדש.
+4. ודאו שמופיעה רשימת שיחות בצד.
+5. בחרו שיחה ושלחו הודעה.
+6. ודאו שמופיע typing indicator.
+7. המתינו לתשובת הבוט וודאו שהיא מופיעה אוטומטית באמצעות polling.
+8. השתמשו בכפתור Search וחפשו טקסט מתוך הודעה קיימת.
+9. רעננו את הדף וודאו שהשיחות וההודעות נשארות.
+10. התחברו עם משתמש אחר וודאו שהוא לא רואה את ההודעות של המשתמש הראשון.
+
+## מסד נתונים
+
+SQLite נשמר מקומית בקובץ:
 
 ```text
 messages.db
 ```
 
-For production hosting, set:
+אפשר לשנות את מיקום מסד הנתונים דרך משתנה סביבה:
 
 ```text
-DATABASE_PATH=/var/data/messages.db
+DATABASE_URL=sqlite:///./messages.db
 ```
 
-On Render, the included `render.yaml` mounts a persistent disk at `/var/data`, so the SQLite file survives restarts and deploys.
+המערכת כוללת טבלאות `users`, `conversations`, `conversation_participants`, ו-`messages`.
 
-## Gemini
+לפי דרישת ה-PRD לפרויקט הדמו, משתמשים חדשים נשמרים גם עם סיסמה גלויה בשדה `password`. זה מתאים לפרויקט לימודי בלבד ולא מתאים לפרודקשן.
 
-Chat Bro uses Gemini through the backend only. The frontend never receives the API key.
+הודעות חדשות נשמרות עם `user_id`, `role`, `message_content`, ו-`conversation_id`, כדי לתמוך בצ'אטים נפרדים לכל משתמש. טבלת `conversations` מוסיפה מזהה מספרי לשיחות עבור ה-API החדש, תוך שמירה על תאימות לשיחות קיימות.
 
-Required environment variables:
+## Deployment ל-Render
+
+הפרויקט כולל `render.yaml` עם שני שירותים:
 
 ```text
-GEMINI_API_KEY=your-gemini-api-key
-GEMINI_MODEL=gemini-2.5-flash
+chat-bro-api  -> FastAPI + SQLite persistent disk
+chat-bro-web  -> Streamlit frontend
 ```
 
-## Deploy With Render
+ב-Render, צרו Blueprint מה-repository. אם שיניתם את שם שירות ה-API, עדכנו את `CHAT_BRO_API_BASE_URL` בשירות `chat-bro-web` לכתובת ה-Render של ה-API.
 
-This repo includes `render.yaml` with two services:
+ה-backend מוגדר עם persistent disk כדי שה-SQLite לא יימחק בריסטארט. ב-Render זה דורש plan שתומך בדיסק.
+
+לפרודקשן עם Gemini, הגדירו ב-Render את:
 
 ```text
-chatbro-backend   FastAPI API
-chatbro-frontend  Streamlit UI
+GEMINI_API_KEY
 ```
-
-In Render:
-
-1. Connect the GitHub repository.
-2. Choose Blueprint deployment.
-3. Select this repository.
-4. Add the secret environment variable `GEMINI_API_KEY` to `chatbro-backend`.
-5. Deploy both services.
-6. Copy the backend public URL.
-7. In `chatbro-frontend`, set `API_BASE_URL` to the backend URL.
-
-Example:
-
-```text
-API_BASE_URL=https://chatbro-backend.onrender.com
-```
-
-If Render gives your backend a different URL, use that exact URL instead.
-
-## Vercel Domain
-
-Vercel is not used to run Streamlit. Use Vercel only as the domain/DNS/front-door layer.
-
-Recommended setup:
-
-1. Deploy Chat Bro on Render.
-2. Copy the live Streamlit frontend URL from Render.
-3. Point your custom domain to the Render frontend service, or configure Vercel to redirect your domain to the Render frontend URL.
-
-The actual running app remains:
-
-```text
-Vercel/custom domain -> Render Streamlit frontend -> Render FastAPI backend -> SQLite persistent disk
-```
-
-## Manual Test
-
-1. Register a new user.
-2. Send a message.
-3. Confirm the typing indicator appears.
-4. Confirm the bot response appears without pressing refresh.
-5. Log out.
-6. Register or log in as a second user.
-7. Confirm the second user does not see the first user's messages.
-8. Ask a Hebrew question and confirm the answer stays in Hebrew and right-to-left.
-
-## Current MVP Scope
-
-Chat Bro currently supports private per-user chat history. Full private chats between users, group chats, admin panels, and a production Postgres migration can be added in a later phase.

@@ -1,19 +1,23 @@
 import os
 import time
 from datetime import datetime
+from uuid import uuid4
 
 import requests
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from passlib.context import CryptContext
 from pydantic import BaseModel
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
-from .database import Message, SessionLocal, User, get_db, init_db
+from .database import Conversation, ConversationParticipant, Message, SessionLocal, User, get_db, init_db
 
 
 app = FastAPI(title="Chat Bro API")
 BOT_USERNAME = "chatbro"
+LEGACY_BOT_USERNAME = "simplebot"
+BOT_USERNAMES = {BOT_USERNAME, LEGACY_BOT_USERNAME}
 BOT_PASSWORD_HASH = "bot-account-cannot-login"
 
 
@@ -59,12 +63,25 @@ class AuthRequest(BaseModel):
 class UserResponse(BaseModel):
     id: int
     username: str
+    success: bool = True
+    message: str | None = None
+    user_id: int | None = None
 
 
 class MessageCreateRequest(BaseModel):
     sender_id: int
     content: str
     conversation_id: str | None = None
+
+
+class ConversationMessageCreateRequest(BaseModel):
+    sender_id: int
+    content: str
+
+
+class ConversationCreateRequest(BaseModel):
+    user_id: int
+    title: str | None = None
 
 
 class MessageResponse(BaseModel):
@@ -77,6 +94,44 @@ class MessageResponse(BaseModel):
     message_content: str
     conversation_id: str
     created_at: datetime
+
+
+class ConversationResponse(BaseModel):
+    id: int
+    title: str
+    conversation_id: str
+    last_message: str | None = None
+    updated_at: datetime
+
+
+class ConversationMessageResponse(BaseModel):
+    id: int
+    conversation_id: int
+    conversation_key: str
+    sender_id: int
+    sender_username: str
+    role: str
+    content: str
+    message_content: str
+    created_at: datetime
+
+
+class SearchMessageResponse(BaseModel):
+    id: int
+    conversation_id: int
+    conversation_key: str
+    conversation_title: str
+    sender_id: int
+    sender_username: str
+    role: str
+    content: str
+    message_content: str
+    created_at: datetime
+
+
+class SearchResponse(BaseModel):
+    conversations: list[ConversationResponse]
+    messages: list[SearchMessageResponse]
 
 
 class GeminiSettingsRequest(BaseModel):
@@ -98,6 +153,8 @@ def on_startup() -> None:
     db = SessionLocal()
     try:
         get_or_create_bot_user(db)
+        sync_conversations_from_messages(db)
+        ensure_default_conversations_for_users(db)
     finally:
         db.close()
 
@@ -111,11 +168,63 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(password: str, password_hash: str) -> bool:
-    return password_context.verify(password, password_hash)
+    try:
+        return password_context.verify(password, password_hash)
+    except ValueError:
+        return password == password_hash
+
+
+def verify_user_password(user: User, password: str) -> bool:
+    if user.password is not None:
+        return password == user.password
+    return verify_password(password, user.password_hash)
 
 
 def default_conversation_id(user_id: int) -> str:
     return f"default-{user_id}"
+
+
+def conversation_title_for_key(conversation_key: str) -> str:
+    if conversation_key.startswith("default-"):
+        return "Chat Bro"
+    return conversation_key.replace("-", " ").replace("_", " ").title() or "Conversation"
+
+
+def title_from_message(content: str) -> str:
+    compact = " ".join(content.split())
+    if not compact:
+        return "Conversation"
+    return compact[:48].rstrip(" ,.;:!?") or "Conversation"
+
+
+def is_auto_conversation_title(conversation: Conversation) -> bool:
+    return (
+        conversation.title == conversation_title_for_key(conversation.conversation_key)
+        or conversation.title.startswith("Chat ")
+        or conversation.title == "New Chat"
+    )
+
+
+def first_user_message_title(db: Session, conversation: Conversation, user_id: int) -> str | None:
+    first_message = (
+        db.query(Message)
+        .filter(
+            Message.user_id == user_id,
+            Message.conversation_id == conversation.conversation_key,
+            Message.role == "user",
+        )
+        .order_by(Message.created_at.asc(), Message.id.asc())
+        .first()
+    )
+    if not first_message:
+        return None
+    return title_from_message(first_message.message_content or first_message.content)
+
+
+def refresh_conversation_title(db: Session, conversation: Conversation, user_id: int, content: str | None = None) -> None:
+    if not is_auto_conversation_title(conversation):
+        return
+    conversation.title = title_from_message(content) if content else first_user_message_title(db, conversation, user_id) or conversation.title
 
 
 def get_or_create_bot_user(db: Session) -> User:
@@ -128,6 +237,71 @@ def get_or_create_bot_user(db: Session) -> User:
     db.commit()
     db.refresh(bot)
     return bot
+
+
+def get_or_create_conversation(
+    db: Session,
+    user_id: int,
+    conversation_key: str | None = None,
+    title: str | None = None,
+) -> Conversation:
+    resolved_key = conversation_key or default_conversation_id(user_id)
+    conversation = db.query(Conversation).filter(Conversation.conversation_key == resolved_key).first()
+    if not conversation:
+        conversation = Conversation(
+            title=title or conversation_title_for_key(resolved_key),
+            conversation_key=resolved_key,
+        )
+        db.add(conversation)
+        db.flush()
+    elif title and conversation.title != title:
+        conversation.title = title
+
+    participant = (
+        db.query(ConversationParticipant)
+        .filter(
+            ConversationParticipant.conversation_id == conversation.id,
+            ConversationParticipant.user_id == user_id,
+        )
+        .first()
+    )
+    if not participant:
+        db.add(ConversationParticipant(conversation_id=conversation.id, user_id=user_id))
+        db.flush()
+
+    return conversation
+
+
+def ensure_default_conversations_for_users(db: Session) -> None:
+    users = db.query(User).filter(~User.username.in_(BOT_USERNAMES)).all()
+    for user in users:
+        get_or_create_conversation(db, user.id)
+    db.commit()
+
+
+def sync_conversations_from_messages(db: Session) -> None:
+    conversation_rows = (
+        db.query(
+            Message.user_id,
+            Message.conversation_id,
+            func.min(Message.created_at),
+            func.max(Message.created_at),
+        )
+        .filter(Message.user_id.isnot(None), Message.conversation_id.isnot(None))
+        .group_by(Message.user_id, Message.conversation_id)
+        .all()
+    )
+
+    for user_id, conversation_key, created_at, updated_at in conversation_rows:
+        if not user_id or not conversation_key:
+            continue
+        conversation = get_or_create_conversation(db, user_id, conversation_key)
+        if created_at and created_at < conversation.created_at:
+            conversation.created_at = created_at
+        if updated_at:
+            conversation.updated_at = updated_at
+
+    db.commit()
 
 
 def message_to_response(message: Message) -> MessageResponse:
@@ -143,6 +317,54 @@ def message_to_response(message: Message) -> MessageResponse:
         conversation_id=message.conversation_id or default_conversation_id(message.user_id or message.sender_id),
         created_at=message.created_at,
     )
+
+
+def conversation_message_to_response(message: Message, conversation: Conversation) -> ConversationMessageResponse:
+    content = message.message_content or message.content
+    return ConversationMessageResponse(
+        id=message.id,
+        conversation_id=conversation.id,
+        conversation_key=conversation.conversation_key,
+        sender_id=message.sender_id,
+        sender_username=message.sender.username,
+        role=message.role or "user",
+        content=content,
+        message_content=content,
+        created_at=message.created_at,
+    )
+
+
+def conversation_to_response(db: Session, conversation: Conversation, user_id: int) -> ConversationResponse:
+    last_message = (
+        db.query(Message)
+        .filter(Message.user_id == user_id, Message.conversation_id == conversation.conversation_key)
+        .order_by(Message.created_at.desc(), Message.id.desc())
+        .first()
+    )
+    last_content = (last_message.message_content or last_message.content) if last_message else None
+    updated_at = last_message.created_at if last_message else conversation.updated_at
+    title = conversation.title
+    if is_auto_conversation_title(conversation):
+        title = first_user_message_title(db, conversation, user_id) or title
+    return ConversationResponse(
+        id=conversation.id,
+        title=title,
+        conversation_id=conversation.conversation_key,
+        last_message=last_content,
+        updated_at=updated_at,
+    )
+
+
+def get_user_conversation(db: Session, user_id: int, conversation_id: int) -> Conversation:
+    conversation = (
+        db.query(Conversation)
+        .join(ConversationParticipant, ConversationParticipant.conversation_id == Conversation.id)
+        .filter(Conversation.id == conversation_id, ConversationParticipant.user_id == user_id)
+        .first()
+    )
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    return conversation
 
 
 def get_recent_conversation(
@@ -266,8 +488,6 @@ def generate_gemini_reply(
 ) -> str | None:
     api_key, model, _source = get_gemini_settings(user_id)
     if not api_key:
-        USER_GEMINI_ERRORS[user_id] = "GEMINI_API_KEY is not configured on the backend."
-        print("Gemini skipped: GEMINI_API_KEY is not configured on the backend.", flush=True)
         return None
 
     try:
@@ -277,12 +497,7 @@ def generate_gemini_reply(
             json=build_gemini_payload(username, content, history),
             timeout=20,
         )
-        if response.status_code >= 400:
-            error_text = response.text[:1000]
-            USER_GEMINI_ERRORS[user_id] = f"Gemini HTTP {response.status_code}: {error_text}"
-            print(f"Gemini HTTP {response.status_code}: {error_text}", flush=True)
-            return None
-
+        response.raise_for_status()
         data = response.json()
         candidates = data.get("candidates", [])
         parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
@@ -292,11 +507,6 @@ def generate_gemini_reply(
         return reply or None
     except requests.RequestException as exc:
         USER_GEMINI_ERRORS[user_id] = str(exc)
-        print(f"Gemini request failed: {exc}", flush=True)
-        return None
-    except ValueError as exc:
-        USER_GEMINI_ERRORS[user_id] = f"Gemini returned invalid JSON: {exc}"
-        print(f"Gemini returned invalid JSON: {exc}", flush=True)
         return None
 
 
@@ -329,6 +539,10 @@ def save_message(
     return message
 
 
+def touch_conversation(conversation: Conversation) -> None:
+    conversation.updated_at = datetime.utcnow()
+
+
 def create_background_bot_reply(
     user_id: int,
     username: str,
@@ -339,8 +553,10 @@ def create_background_bot_reply(
     db = SessionLocal()
     try:
         bot = get_or_create_bot_user(db)
+        conversation = get_or_create_conversation(db, user_id, conversation_id)
         history = get_recent_conversation(db, user_id, conversation_id)
         reply = generate_bot_reply(user_id, username, content, history)
+        touch_conversation(conversation)
         save_message(db, user_id, bot.id, reply, "assistant", conversation_id)
     finally:
         db.close()
@@ -363,7 +579,7 @@ def get_gemini_status(
     db: Session = Depends(get_db),
 ) -> GeminiSettingsResponse:
     user = db.query(User).filter(User.id == user_id).first()
-    if not user or user.username == BOT_USERNAME:
+    if not user or user.username in BOT_USERNAMES:
         raise HTTPException(status_code=404, detail="User not found.")
 
     api_key, model, source = get_gemini_settings(user_id)
@@ -375,13 +591,261 @@ def get_gemini_status(
     )
 
 
+@app.get("/conversations", response_model=list[ConversationResponse])
+def get_conversations(
+    user_id: int = Query(..., ge=1),
+    db: Session = Depends(get_db),
+) -> list[ConversationResponse]:
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user or user.username in BOT_USERNAMES:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    get_or_create_conversation(db, user.id)
+    db.commit()
+    conversations = (
+        db.query(Conversation)
+        .join(ConversationParticipant, ConversationParticipant.conversation_id == Conversation.id)
+        .filter(ConversationParticipant.user_id == user.id)
+        .order_by(Conversation.updated_at.desc(), Conversation.id.desc())
+        .all()
+    )
+    return [conversation_to_response(db, conversation, user.id) for conversation in conversations]
+
+
+@app.post("/conversations", response_model=ConversationResponse, status_code=status.HTTP_201_CREATED)
+def create_conversation(
+    payload: ConversationCreateRequest,
+    db: Session = Depends(get_db),
+) -> ConversationResponse:
+    user = db.query(User).filter(User.id == payload.user_id).first()
+    if not user or user.username in BOT_USERNAMES:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    existing_count = (
+        db.query(ConversationParticipant)
+        .filter(ConversationParticipant.user_id == user.id)
+        .count()
+    )
+    title = (payload.title or "").strip() or f"Chat {existing_count + 1}"
+    conversation = Conversation(
+        title=title,
+        conversation_key=f"chat-{user.id}-{uuid4().hex[:12]}",
+    )
+    db.add(conversation)
+    db.flush()
+    db.add(ConversationParticipant(conversation_id=conversation.id, user_id=user.id))
+    db.commit()
+    db.refresh(conversation)
+    return conversation_to_response(db, conversation, user.id)
+
+
+@app.get("/conversations/{conversation_id}/messages", response_model=list[ConversationMessageResponse])
+def get_conversation_messages(
+    conversation_id: int,
+    user_id: int = Query(..., ge=1),
+    after_id: int | None = Query(default=None, ge=0),
+    limit: int = Query(default=100, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> list[ConversationMessageResponse]:
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user or user.username in BOT_USERNAMES:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    conversation = get_user_conversation(db, user.id, conversation_id)
+    query = db.query(Message).filter(
+        Message.user_id == user.id,
+        Message.conversation_id == conversation.conversation_key,
+    )
+    if after_id is not None:
+        query = query.filter(Message.id > after_id)
+
+    messages = query.order_by(Message.created_at.asc(), Message.id.asc()).limit(limit).all()
+    return [conversation_message_to_response(message, conversation) for message in messages]
+
+
+@app.post(
+    "/conversations/{conversation_id}/messages",
+    response_model=ConversationMessageResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_conversation_message(
+    conversation_id: int,
+    payload: ConversationMessageCreateRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+) -> ConversationMessageResponse:
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Message content cannot be empty.")
+
+    sender = db.query(User).filter(User.id == payload.sender_id).first()
+    if not sender:
+        raise HTTPException(status_code=404, detail="Sender not found.")
+    if sender.username in BOT_USERNAMES:
+        raise HTTPException(status_code=400, detail="Bot messages are generated by the backend.")
+
+    conversation = get_user_conversation(db, sender.id, conversation_id)
+    touch_conversation(conversation)
+    refresh_conversation_title(db, conversation, sender.id, content)
+    message = save_message(db, sender.id, sender.id, content, "user", conversation.conversation_key)
+    background_tasks.add_task(
+        create_background_bot_reply,
+        sender.id,
+        sender.username,
+        content,
+        conversation.conversation_key,
+    )
+    return conversation_message_to_response(message, conversation)
+
+
+@app.get("/messages/search", response_model=list[SearchMessageResponse])
+def search_messages(
+    user_id: int = Query(..., ge=1),
+    q: str = Query(..., min_length=1),
+    limit: int = Query(default=50, ge=1, le=200),
+    db: Session = Depends(get_db),
+) -> list[SearchMessageResponse]:
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user or user.username in BOT_USERNAMES:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    search_term = q.strip()
+    if not search_term:
+        raise HTTPException(status_code=400, detail="Search term cannot be empty.")
+
+    conversations = (
+        db.query(Conversation)
+        .join(ConversationParticipant, ConversationParticipant.conversation_id == Conversation.id)
+        .filter(ConversationParticipant.user_id == user.id)
+        .all()
+    )
+    conversations_by_key = {conversation.conversation_key: conversation for conversation in conversations}
+    like_term = f"%{search_term}%"
+    messages = (
+        db.query(Message)
+        .filter(
+            Message.user_id == user.id,
+            or_(Message.message_content.ilike(like_term), Message.content.ilike(like_term)),
+        )
+        .order_by(Message.created_at.desc(), Message.id.desc())
+        .limit(limit)
+        .all()
+    )
+
+    results: list[SearchMessageResponse] = []
+    for message in messages:
+        conversation_key = message.conversation_id or default_conversation_id(user.id)
+        conversation = conversations_by_key.get(conversation_key)
+        if not conversation:
+            conversation = get_or_create_conversation(db, user.id, conversation_key)
+            conversations_by_key[conversation_key] = conversation
+
+        content = message.message_content or message.content
+        results.append(
+            SearchMessageResponse(
+                id=message.id,
+                conversation_id=conversation.id,
+                conversation_key=conversation.conversation_key,
+                conversation_title=conversation.title,
+                sender_id=message.sender_id,
+                sender_username=message.sender.username,
+                role=message.role or "user",
+                content=content,
+                message_content=content,
+                created_at=message.created_at,
+            )
+        )
+
+    db.commit()
+    return results
+
+
+@app.get("/search", response_model=SearchResponse)
+def search(
+    user_id: int = Query(..., ge=1),
+    q: str = Query(..., min_length=1),
+    limit: int = Query(default=50, ge=1, le=200),
+    db: Session = Depends(get_db),
+) -> SearchResponse:
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user or user.username in BOT_USERNAMES:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    search_term = q.strip()
+    if not search_term:
+        raise HTTPException(status_code=400, detail="Search term cannot be empty.")
+
+    like_term = f"%{search_term}%"
+    conversations = (
+        db.query(Conversation)
+        .join(ConversationParticipant, ConversationParticipant.conversation_id == Conversation.id)
+        .filter(
+            ConversationParticipant.user_id == user.id,
+            Conversation.title.ilike(like_term),
+        )
+        .order_by(Conversation.updated_at.desc(), Conversation.id.desc())
+        .limit(20)
+        .all()
+    )
+
+    messages = (
+        db.query(Message)
+        .filter(
+            Message.user_id == user.id,
+            or_(Message.message_content.ilike(like_term), Message.content.ilike(like_term)),
+        )
+        .order_by(Message.created_at.desc(), Message.id.desc())
+        .limit(limit)
+        .all()
+    )
+
+    conversations_by_key = {
+        conversation.conversation_key: conversation
+        for conversation in (
+            db.query(Conversation)
+            .join(ConversationParticipant, ConversationParticipant.conversation_id == Conversation.id)
+            .filter(ConversationParticipant.user_id == user.id)
+            .all()
+        )
+    }
+    message_results: list[SearchMessageResponse] = []
+    for message in messages:
+        conversation_key = message.conversation_id or default_conversation_id(user.id)
+        conversation = conversations_by_key.get(conversation_key)
+        if not conversation:
+            conversation = get_or_create_conversation(db, user.id, conversation_key)
+            conversations_by_key[conversation_key] = conversation
+
+        content = message.message_content or message.content
+        message_results.append(
+            SearchMessageResponse(
+                id=message.id,
+                conversation_id=conversation.id,
+                conversation_key=conversation.conversation_key,
+                conversation_title=conversation.title,
+                sender_id=message.sender_id,
+                sender_username=message.sender.username,
+                role=message.role or "user",
+                content=content,
+                message_content=content,
+                created_at=message.created_at,
+            )
+        )
+
+    db.commit()
+    return SearchResponse(
+        conversations=[conversation_to_response(db, conversation, user.id) for conversation in conversations],
+        messages=message_results,
+    )
+
+
 @app.post("/settings/gemini", response_model=GeminiSettingsResponse)
 def save_gemini_settings(
     payload: GeminiSettingsRequest,
     db: Session = Depends(get_db),
 ) -> GeminiSettingsResponse:
     user = db.query(User).filter(User.id == payload.user_id).first()
-    if not user or user.username == BOT_USERNAME:
+    if not user or user.username in BOT_USERNAMES:
         raise HTTPException(status_code=404, detail="User not found.")
 
     raise HTTPException(
@@ -391,7 +855,7 @@ def save_gemini_settings(
 
 
 @app.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-def register(payload: AuthRequest, db: Session = Depends(get_db)) -> User:
+def register(payload: AuthRequest, db: Session = Depends(get_db)) -> UserResponse:
     username = normalize_username(payload.username)
     password = payload.password
 
@@ -399,29 +863,43 @@ def register(payload: AuthRequest, db: Session = Depends(get_db)) -> User:
         raise HTTPException(status_code=400, detail="Username is required.")
     if not password:
         raise HTTPException(status_code=400, detail="Password is required.")
-    if username == BOT_USERNAME:
+    if username in BOT_USERNAMES:
         raise HTTPException(status_code=400, detail="This username is reserved.")
 
     existing_user = db.query(User).filter(User.username == username).first()
     if existing_user:
         raise HTTPException(status_code=400, detail="Username already exists.")
 
-    user = User(username=username, password_hash=hash_password(password))
+    user = User(username=username, password=password, password_hash=password)
     db.add(user)
     db.commit()
     db.refresh(user)
-    return user
+    get_or_create_conversation(db, user.id)
+    db.commit()
+    return UserResponse(
+        id=user.id,
+        username=user.username,
+        user_id=user.id,
+        message="User registered successfully",
+    )
 
 
 @app.post("/login", response_model=UserResponse)
-def login(payload: AuthRequest, db: Session = Depends(get_db)) -> User:
+def login(payload: AuthRequest, db: Session = Depends(get_db)) -> UserResponse:
     username = normalize_username(payload.username)
     user = db.query(User).filter(User.username == username).first()
 
-    if not user or user.username == BOT_USERNAME or not verify_password(payload.password, user.password_hash):
+    if not user or user.username in BOT_USERNAMES or not verify_user_password(user, payload.password):
         raise HTTPException(status_code=401, detail="Invalid username or password.")
 
-    return user
+    get_or_create_conversation(db, user.id)
+    db.commit()
+    return UserResponse(
+        id=user.id,
+        username=user.username,
+        user_id=user.id,
+        message="Login successful",
+    )
 
 
 @app.post("/messages", response_model=MessageResponse, status_code=status.HTTP_201_CREATED)
@@ -437,10 +915,13 @@ def create_message(
     sender = db.query(User).filter(User.id == payload.sender_id).first()
     if not sender:
         raise HTTPException(status_code=404, detail="Sender not found.")
-    if sender.username == BOT_USERNAME:
+    if sender.username in BOT_USERNAMES:
         raise HTTPException(status_code=400, detail="Bot messages are generated by the backend.")
 
     conversation_id = payload.conversation_id or default_conversation_id(sender.id)
+    conversation = get_or_create_conversation(db, sender.id, conversation_id)
+    touch_conversation(conversation)
+    refresh_conversation_title(db, conversation, sender.id, content)
     message = save_message(db, sender.id, sender.id, content, "user", conversation_id)
     background_tasks.add_task(create_background_bot_reply, sender.id, sender.username, content, conversation_id)
     return message_to_response(message)
@@ -450,21 +931,24 @@ def create_message(
 def get_messages(
     user_id: int = Query(..., ge=1),
     conversation_id: str | None = None,
+    after_id: int | None = Query(default=None, ge=0),
     limit: int = Query(default=100, ge=1, le=500),
     db: Session = Depends(get_db),
 ) -> list[MessageResponse]:
     user = db.query(User).filter(User.id == user_id).first()
-    if not user or user.username == BOT_USERNAME:
+    if not user or user.username in BOT_USERNAMES:
         raise HTTPException(status_code=404, detail="User not found.")
 
     resolved_conversation_id = conversation_id or default_conversation_id(user_id)
-    messages = (
-        db.query(Message)
-        .filter(Message.user_id == user_id, Message.conversation_id == resolved_conversation_id)
-        .join(User, Message.sender_id == User.id)
-        .order_by(Message.created_at.asc(), Message.id.asc())
-        .limit(limit)
-        .all()
+    get_or_create_conversation(db, user_id, resolved_conversation_id)
+    db.commit()
+    query = db.query(Message).filter(
+        Message.user_id == user_id,
+        Message.conversation_id == resolved_conversation_id,
     )
+    if after_id is not None:
+        query = query.filter(Message.id > after_id)
+
+    messages = query.join(User, Message.sender_id == User.id).order_by(Message.created_at.asc(), Message.id.asc()).limit(limit).all()
 
     return [message_to_response(message) for message in messages]

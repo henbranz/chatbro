@@ -1,28 +1,26 @@
 services:
   - type: web
-    name: chatbro-backend
+    name: chat-bro-api
     runtime: python
-    plan: free
+    plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
-    disk:
-      name: chatbro-data
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
-      - key: DATABASE_PATH
-        value: /var/data/messages.db
+      - key: DATABASE_URL
+        value: sqlite:////var/data/messages.db
       - key: GEMINI_MODEL
         value: gemini-2.5-flash
-      - key: GEMINI_API_KEY
-        sync: false
+    disk:
+      name: chat-bro-data
+      mountPath: /var/data
+      sizeGB: 1
 
   - type: web
-    name: chatbro-frontend
+    name: chat-bro-web
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: streamlit run frontend/app.py --server.address 0.0.0.0 --server.port $PORT --server.headless true --browser.gatherUsageStats false
+    startCommand: streamlit run frontend/app.py --server.address 0.0.0.0 --server.port $PORT --server.headless true
     envVars:
-      - key: API_BASE_URL
-        value: https://chatbro-backend.onrender.com
+      - key: CHAT_BRO_API_BASE_URL
+        value: https://chat-bro-api.onrender.com

@@ -1,32 +1,22 @@
+import base64
+import os
 import time
 from datetime import datetime
 from html import escape
-import os
+from pathlib import Path
 import re
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
 
 
-def get_api_base_url() -> str:
-    env_value = os.getenv("API_BASE_URL")
-    if env_value:
-        return env_value.rstrip("/")
-
-    try:
-        secret_value = st.secrets.get("API_BASE_URL")
-    except Exception:
-        secret_value = None
-
-    return (secret_value or "http://127.0.0.1:8000").rstrip("/")
-
-
-API_BASE_URL = get_api_base_url()
+API_BASE_URL = os.getenv("CHAT_BRO_API_BASE_URL", "http://127.0.0.1:8000")
 REQUEST_TIMEOUT = 5
 PRODUCT_NAME = "Chat Bro"
+POLLING_INTERVAL_SECONDS = 3
+LOGO_PATH = Path(__file__).resolve().parent / "assets" / "chat-bro-logo.png"
 
 
 st.set_page_config(
@@ -42,8 +32,47 @@ def init_session_state() -> None:
         st.session_state.is_authenticated = False
     if "conversation_id" not in st.session_state:
         st.session_state.conversation_id = None
+    if "selected_conversation_id" not in st.session_state:
+        st.session_state.selected_conversation_id = None
     if "should_scroll_bottom" not in st.session_state:
         st.session_state.should_scroll_bottom = False
+    if "show_search" not in st.session_state:
+        st.session_state.show_search = False
+    if "search_query" not in st.session_state:
+        st.session_state.search_query = ""
+    if "search_results" not in st.session_state:
+        st.session_state.search_results = None
+    if "last_search_query" not in st.session_state:
+        st.session_state.last_search_query = ""
+    if "show_login_password" not in st.session_state:
+        st.session_state.show_login_password = False
+    if "show_register_password" not in st.session_state:
+        st.session_state.show_register_password = False
+    restore_user_from_url()
+
+
+def restore_user_from_url() -> None:
+    if st.session_state.user:
+        return
+
+    user_id = st.query_params.get("user_id")
+    username = st.query_params.get("username")
+    if not user_id or not username:
+        return
+
+    try:
+        resolved_user_id = int(user_id)
+    except ValueError:
+        return
+
+    st.session_state.user = {
+        "id": resolved_user_id,
+        "user_id": resolved_user_id,
+        "username": username,
+        "success": True,
+    }
+    st.session_state.is_authenticated = True
+    st.session_state.conversation_id = st.query_params.get("conversation_id") or f"default-{resolved_user_id}"
 
 
 def get_error_detail(response: requests.Response) -> str:
@@ -91,12 +120,39 @@ def login_user(username: str, password: str):
     return api_request("POST", "/login", json={"username": username, "password": password})
 
 
-def authenticate(user: dict[str, Any]) -> None:
+def submit_login_from_fields() -> None:
+    username = st.session_state.get("login_username", "").strip()
+    password = st.session_state.get("login_password", "").strip()
+    if username and password:
+        user = login_user(username, password)
+        if user:
+            authenticate(user, rerun=False)
+
+
+def submit_register_from_fields() -> None:
+    username = st.session_state.get("register_username", "").strip()
+    password = st.session_state.get("register_password", "").strip()
+    if len(username) >= 3 and len(password) >= 4:
+        user = register_user(username, password)
+        if user:
+            authenticate(user, rerun=False)
+
+
+def authenticate(user: dict[str, Any], *, rerun: bool = True) -> None:
     st.session_state.user = user
     st.session_state.is_authenticated = True
     st.session_state.conversation_id = f"default-{user['id']}"
+    st.session_state.selected_conversation_id = None
     st.session_state.should_scroll_bottom = True
-    st.rerun()
+    st.session_state.show_search = False
+    st.session_state.search_query = ""
+    st.session_state.search_results = None
+    st.session_state.last_search_query = ""
+    st.query_params["user_id"] = str(user["id"])
+    st.query_params["username"] = user["username"]
+    st.query_params["conversation_id"] = st.session_state.conversation_id
+    if rerun:
+        st.rerun()
 
 
 def fetch_messages(user_id: int, conversation_id: str):
@@ -107,6 +163,10 @@ def fetch_messages(user_id: int, conversation_id: str):
     )
 
 
+def fetch_conversations(user_id: int):
+    return api_request("GET", "/conversations", params={"user_id": user_id})
+
+
 def send_message(sender_id: int, content: str, conversation_id: str):
     return api_request(
         "POST",
@@ -115,8 +175,28 @@ def send_message(sender_id: int, content: str, conversation_id: str):
     )
 
 
+def create_conversation(user_id: int, title: str = "New Chat"):
+    return api_request("POST", "/conversations", json={"user_id": user_id, "title": title})
+
+
+def search_messages(user_id: int, query: str):
+    return api_request("GET", "/messages/search", params={"user_id": user_id, "q": query})
+
+
+def search_chats_and_messages(user_id: int, query: str):
+    return api_request("GET", "/search", params={"user_id": user_id, "q": query})
+
+
 def fetch_gemini_status(user_id: int):
     return api_request("GET", "/settings/gemini", params={"user_id": user_id})
+
+
+@st.cache_data
+def logo_background_value() -> str:
+    if not LOGO_PATH.exists():
+        return "none"
+    encoded = base64.b64encode(LOGO_PATH.read_bytes()).decode("ascii")
+    return f"url('data:image/png;base64,{encoded}')"
 
 
 def format_timestamp(value: str) -> str:
@@ -127,6 +207,21 @@ def format_timestamp(value: str) -> str:
         return parsed.astimezone(ZoneInfo("Asia/Jerusalem")).strftime("%H:%M")
     except ValueError:
         return value
+
+
+def truncate_text(value: str | None, max_length: int = 72) -> str:
+    if not value:
+        return "No messages yet"
+    compact = " ".join(value.split())
+    if len(compact) <= max_length:
+        return compact
+    return f"{compact[: max_length - 1].rstrip()}..."
+
+
+def conversation_label(conversation: dict[str, Any]) -> str:
+    preview = truncate_text(conversation.get("last_message"), 48)
+    updated_at = format_timestamp(conversation["updated_at"])
+    return f"{conversation['title']}  ·  {preview}  ·  {updated_at}"
 
 
 def contains_hebrew(value: str) -> bool:
@@ -198,21 +293,32 @@ def format_message_content(value: str) -> str:
 
 
 def inject_css() -> None:
+    logo_background = logo_background_value()
     st.markdown(
         """
         <style>
         :root {
-            --bg: #f7f4ed;
-            --glass: rgba(255, 253, 248, 0.68);
-            --glass-strong: rgba(255, 253, 248, 0.86);
-            --text: #191814;
-            --muted: #5f584f;
-            --line: rgba(96, 76, 55, 0.18);
-            --accent: #c96442;
-            --accent-soft: #f5dfd5;
-            --user: #2f2a24;
-            --bot: rgba(255, 250, 241, 0.92);
-            --shadow: 0 20px 70px rgba(54, 43, 31, 0.12);
+            --cb-bg: #f6efe4;
+            --cb-surface: rgba(255, 250, 241, 0.82);
+            --cb-surface-solid: #fffaf1;
+            --cb-text: #1f1f1d;
+            --cb-muted: #7d7768;
+            --cb-orange: #d9772f;
+            --cb-orange-soft: #e7a15f;
+            --cb-olive: #7c7a63;
+            --cb-border: rgba(90, 74, 52, 0.16);
+            --cb-shadow: rgba(55, 43, 28, 0.16);
+            --bg: var(--cb-bg);
+            --glass: var(--cb-surface);
+            --glass-strong: rgba(255, 250, 241, 0.92);
+            --text: var(--cb-text);
+            --muted: var(--cb-muted);
+            --line: var(--cb-border);
+            --accent: var(--cb-orange);
+            --accent-soft: rgba(231, 161, 95, 0.24);
+            --user: #2c2620;
+            --bot: rgba(255, 250, 241, 0.94);
+            --shadow: 0 20px 70px var(--cb-shadow);
         }
 
         .stApp {
@@ -223,21 +329,67 @@ def inject_css() -> None:
             color: var(--text);
         }
 
+        .stApp:has(.auth-page) {
+            background: var(--cb-bg);
+        }
+
+        .stApp:has(.auth-page)::before {
+            content: "";
+            position: fixed;
+            inset: 0;
+            background-image: __CHAT_BRO_LOGO__;
+            background-size: cover;
+            background-position: center;
+            background-repeat: no-repeat;
+            opacity: 0.4;
+            filter: saturate(0.94) blur(0.3px);
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        .stApp:has(.auth-page)::after {
+            content: "";
+            position: fixed;
+            inset: 0;
+            background: linear-gradient(180deg, rgba(246,239,228,0.36), rgba(255,250,241,0.50));
+            pointer-events: none;
+            z-index: 0;
+        }
+
         .block-container {
             max-width: 1040px;
             padding: 28px 22px 34px;
+            position: relative;
+            z-index: 1;
         }
 
         #MainMenu, footer, header {
             visibility: hidden;
         }
 
+        .stApp:has(.auth-page) div[data-testid="stTabs"] [role="tablist"] {
+            justify-content: center;
+            gap: 8px;
+        }
+
+        .stApp:has(.auth-page) div[data-testid="stTabs"] {
+            max-width: 460px;
+            margin: 0 auto 24px;
+            padding: 18px 22px 22px;
+            border: 1px solid var(--line);
+            border-radius: 28px;
+            background: var(--glass-strong);
+            box-shadow: 0 18px 55px rgba(55,43,28,0.13);
+            backdrop-filter: blur(22px);
+        }
+
         button[data-baseweb="tab"] {
             color: var(--text) !important;
             font-weight: 800 !important;
             opacity: 1 !important;
-            padding-left: 0 !important;
-            padding-right: 18px !important;
+            padding-left: 14px !important;
+            padding-right: 14px !important;
+            border-radius: 999px !important;
         }
 
         button[data-baseweb="tab"] p {
@@ -260,12 +412,12 @@ def inject_css() -> None:
 
         .auth-hero {
             max-width: 460px;
-            margin: 6vh auto 18px;
+            margin: 5vh auto 18px;
             padding: 28px 26px;
             text-align: center;
-            background: var(--glass);
+            background: rgba(255, 250, 241, 0.78);
             border: 1px solid var(--line);
-            border-radius: 32px;
+            border-radius: 28px;
             box-shadow: var(--shadow);
             backdrop-filter: blur(22px);
             transition: transform 180ms ease, box-shadow 180ms ease, border-color 180ms ease;
@@ -277,17 +429,8 @@ def inject_css() -> None:
             box-shadow: 0 24px 80px rgba(54, 43, 31, 0.15);
         }
 
-        .eyebrow {
-            display: inline-flex;
-            align-items: center;
-            padding: 7px 12px;
-            border-radius: 999px;
-            color: #9f4429;
-            background: rgba(245, 223, 213, 0.78);
-            border: 1px solid rgba(201,100,66,0.18);
-            font-size: 12px;
-            font-weight: 800;
-            margin-bottom: 14px;
+        .auth-page {
+            display: none;
         }
 
         .title {
@@ -297,15 +440,16 @@ def inject_css() -> None:
             line-height: 1.12;
             font-weight: 820;
             letter-spacing: 0;
+            white-space: nowrap;
         }
 
         .subtitle {
             max-width: 540px;
             margin: 12px auto 0;
             color: var(--muted);
-            font-size: 15px;
+            font-size: 16px;
             line-height: 1.55;
-            font-weight: 520;
+            font-weight: 720;
         }
 
         .topbar {
@@ -320,6 +464,17 @@ def inject_css() -> None:
             border-radius: 999px;
             box-shadow: 0 14px 45px rgba(54,43,31,0.08);
             backdrop-filter: blur(20px);
+        }
+
+        .topbar-message {
+            flex: 1;
+            color: var(--muted);
+            font-size: 15px;
+            line-height: 1.45;
+            text-align: center;
+            font-weight: 780;
+            direction: rtl;
+            unicode-bidi: isolate;
         }
 
         .brand {
@@ -383,6 +538,104 @@ def inject_css() -> None:
             font-weight: 800;
         }
 
+        .sidebar-title {
+            margin: 0 0 8px;
+            color: var(--text);
+            font-size: 14px;
+            font-weight: 850;
+        }
+
+        .sidebar-caption {
+            margin: 0 0 12px;
+            color: var(--muted);
+            font-size: 12px;
+            line-height: 1.45;
+        }
+
+        div[role="radiogroup"] {
+            gap: 8px;
+        }
+
+        div[role="radiogroup"] label {
+            flex: 0 0 auto !important;
+            width: 100%;
+            min-height: 48px;
+            padding: 10px 12px !important;
+            margin-bottom: 8px;
+            border: 1px solid rgba(137, 89, 42, 0.18);
+            border-radius: 16px;
+            background: linear-gradient(135deg, rgba(231,161,95,0.48), rgba(255,250,241,0.72));
+            color: var(--text) !important;
+            transition: transform 160ms ease, border-color 160ms ease, background 160ms ease, box-shadow 160ms ease;
+        }
+
+        div[role="radiogroup"] label:not(:has(input:checked)),
+        div[role="radiogroup"] label:not(:has(input:checked)) p,
+        div[role="radiogroup"] label:not(:has(input:checked)) span {
+            color: var(--text) !important;
+            -webkit-text-fill-color: var(--text) !important;
+        }
+
+        div[role="radiogroup"] label p,
+        div[role="radiogroup"] label span {
+            color: inherit !important;
+        }
+
+        div[role="radiogroup"] label:hover {
+            transform: translateY(-1px);
+            border-color: rgba(217,119,47,0.34);
+            background: linear-gradient(135deg, rgba(231,161,95,0.62), rgba(255,250,241,0.90));
+            box-shadow: 0 10px 22px rgba(55,43,28,0.10);
+        }
+
+        div[role="radiogroup"] label:has(input:checked) {
+            border-color: rgba(95, 65, 34, 0.42);
+            background: linear-gradient(135deg, #d9772f, #c96d2c);
+            color: #fffaf1 !important;
+            -webkit-text-fill-color: #fffaf1 !important;
+            box-shadow: 0 12px 26px rgba(137,89,42,0.20);
+        }
+
+        div[role="radiogroup"] label:has(input:checked) p,
+        div[role="radiogroup"] label:has(input:checked) span {
+            color: #fffaf1 !important;
+            -webkit-text-fill-color: #fffaf1 !important;
+        }
+
+        .search-result {
+            padding: 10px 0 8px;
+            border-bottom: 1px solid rgba(96,76,55,0.13);
+        }
+
+        .search-result:last-child {
+            border-bottom: 0;
+        }
+
+        .search-meta {
+            margin-bottom: 5px;
+            color: var(--muted);
+            font-size: 11px;
+            font-weight: 760;
+        }
+
+        .search-text {
+            color: var(--text);
+            font-size: 13px;
+            line-height: 1.42;
+            overflow-wrap: anywhere;
+        }
+
+        .search-kind {
+            display: inline-flex;
+            margin-right: 6px;
+            padding: 2px 7px;
+            border-radius: 999px;
+            background: rgba(231,161,95,0.22);
+            color: #79411e;
+            font-size: 10px;
+            font-weight: 850;
+        }
+
         .chat-panel {
             background: var(--glass);
             border: 1px solid var(--line);
@@ -395,8 +648,15 @@ def inject_css() -> None:
         .chat-intro {
             padding: 4px 6px 14px;
             color: var(--muted);
-            font-size: 14px;
+            font-size: 15px;
             line-height: 1.5;
+            text-align: center;
+            font-weight: 700;
+        }
+
+        .chat-intro[dir="rtl"] {
+            direction: rtl;
+            unicode-bidi: isolate;
         }
 
         .messages {
@@ -581,6 +841,17 @@ def inject_css() -> None:
             padding: 6px;
         }
 
+        div[data-testid="stForm"]:has(input[placeholder="Search chats or messages..."]) {
+            max-width: none;
+            margin: 0 0 14px;
+            padding: 0;
+            border: 0;
+            border-radius: 0;
+            background: transparent;
+            box-shadow: none;
+            backdrop-filter: none;
+        }
+
         div[data-testid="stTextInput"] input {
             min-height: 44px;
             border-radius: 999px !important;
@@ -637,15 +908,19 @@ def inject_css() -> None:
             outline: none !important;
         }
 
-        div[data-testid="stTextInput"] button,
-        div[data-testid="stTextInput"] button:hover,
-        div[data-testid="stTextInput"] button:focus {
-            background: rgba(47,42,36,0.08) !important;
-            border: 0 !important;
+        div[data-testid="stTextInput"] button {
+            display: none !important;
+        }
+
+        div[data-testid="stTextInput"]:has(input[placeholder="Search chats or messages..."]) div[data-baseweb="input"] {
             border-radius: 999px !important;
-            box-shadow: none !important;
-            color: var(--text) !important;
-            margin-right: 3px !important;
+            border-color: rgba(217,119,47,0.24) !important;
+            background: rgba(255,250,241,0.88) !important;
+        }
+
+        div[data-testid="stTextInput"]:has(input[placeholder="Search chats or messages..."]) input {
+            background-image: none !important;
+            padding-right: 1rem !important;
         }
 
         div[data-testid="stTextInput"] input:-webkit-autofill,
@@ -668,6 +943,49 @@ def inject_css() -> None:
             transition: transform 160ms ease, box-shadow 160ms ease, background 160ms ease, border-color 160ms ease;
         }
 
+        .stButton > button:focus,
+        div[data-testid="stFormSubmitButton"] button:focus,
+        div[data-testid="stTextInput"] div[data-baseweb="input"]:focus-within {
+            outline: 3px solid rgba(217,119,47,0.20) !important;
+            outline-offset: 2px !important;
+        }
+
+        button:has(span[data-testid="stIconMaterial"]) {
+            min-width: 48px !important;
+            width: 48px !important;
+            height: 44px !important;
+            min-height: 44px !important;
+            padding: 0 !important;
+            border-radius: 999px !important;
+            background: rgba(255,250,241,0.88) !important;
+            border: 1px solid rgba(217,119,47,0.24) !important;
+            color: var(--cb-orange) !important;
+            box-shadow: 0 6px 16px rgba(55,43,28,0.07) !important;
+        }
+
+        .st-key-toggle_login_password button:has(span[data-testid="stIconMaterial"]),
+        .st-key-toggle_register_password button:has(span[data-testid="stIconMaterial"]) {
+            height: 40px !important;
+            min-height: 40px !important;
+            margin-top: 12px !important;
+        }
+
+        button:has(span[data-testid="stIconMaterial"]):hover {
+            background: rgba(231,161,95,0.18) !important;
+            border-color: rgba(217,119,47,0.42) !important;
+            color: #a95322 !important;
+        }
+
+        button:has(span[data-testid="stIconMaterial"]) div[data-testid="stMarkdownContainer"] {
+            display: none !important;
+            position: absolute !important;
+            width: 0 !important;
+            height: 0 !important;
+            overflow: hidden !important;
+            clip: rect(0, 0, 0, 0) !important;
+            white-space: nowrap !important;
+        }
+
         .stButton > button:hover {
             transform: translateY(-1px);
             border-color: rgba(201,100,66,0.45) !important;
@@ -683,6 +1001,18 @@ def inject_css() -> None:
             box-shadow: 0 10px 22px rgba(47,42,36,0.16) !important;
         }
 
+        div[data-testid="stForm"]:has(input[placeholder="Search chats or messages..."]) div[data-testid="stFormSubmitButton"] button {
+            min-width: 44px !important;
+            width: 44px !important;
+            height: 44px !important;
+            min-height: 44px !important;
+            padding: 0 !important;
+            background: rgba(255,250,241,0.88) !important;
+            color: var(--cb-orange) !important;
+            border-color: rgba(217,119,47,0.24) !important;
+            box-shadow: 0 6px 16px rgba(55,43,28,0.07) !important;
+        }
+
         div[data-testid="stFormSubmitButton"] button:hover,
         div[data-testid="stFormSubmitButton"] button:focus {
             transform: translateY(-1px);
@@ -693,6 +1023,12 @@ def inject_css() -> None:
         }
 
         [data-testid="stHorizontalBlock"] {
+            align-items: flex-start;
+        }
+
+        .stApp:has(.auth-page) [data-testid="stHorizontalBlock"],
+        div[data-testid="stForm"]:has(input[placeholder="Message Chat Bro..."]) [data-testid="stHorizontalBlock"],
+        div[data-testid="stForm"]:has(input[placeholder="Search chats or messages..."]) [data-testid="stHorizontalBlock"] {
             align-items: center;
         }
 
@@ -709,12 +1045,17 @@ def inject_css() -> None:
 
             .title {
                 font-size: 29px;
+                white-space: normal;
             }
 
             .topbar {
                 border-radius: 24px;
                 align-items: flex-start;
                 flex-direction: column;
+            }
+
+            div[role="radiogroup"] label {
+                min-height: 44px;
             }
 
             .brand {
@@ -748,7 +1089,7 @@ def inject_css() -> None:
             }
         }
         </style>
-        """,
+        """.replace("__CHAT_BRO_LOGO__", logo_background),
         unsafe_allow_html=True,
     )
 
@@ -802,7 +1143,7 @@ def render_messages(
 
 def scroll_messages_to_bottom(force: bool) -> None:
     behavior = "smooth" if force else "auto"
-    components.html(
+    st.html(
         f"""
         <script>
         const scrollLatestMessages = () => {{
@@ -816,98 +1157,12 @@ def scroll_messages_to_bottom(force: bool) -> None:
         setTimeout(scrollLatestMessages, 280);
         </script>
         """,
-        height=0,
+        unsafe_allow_javascript=True,
     )
 
 
-def rerun_while_typing() -> None:
-    time.sleep(1.25)
-    st.rerun()
-
-
-def render_auth_screen() -> None:
-    st.markdown(
-        f"""
-        <div class="auth-hero">
-            <div class="eyebrow">Premium chat workspace</div>
-            <h1 class="title">Welcome to {PRODUCT_NAME}</h1>
-            <p class="subtitle">A rounded, glassy chat experience with private per-user conversations.</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    login_tab, register_tab = st.tabs(["Login", "Register"])
-
-    with login_tab:
-        with st.form("login_form"):
-            username = st.text_input("Username", key="login_username")
-            password = st.text_input("Password", type="password", key="login_password")
-            submitted = st.form_submit_button("Login", use_container_width=True)
-
-        if submitted:
-            if not username.strip() or not password.strip():
-                st.warning("Please enter a username and password.")
-            else:
-                user = login_user(username, password)
-                if user:
-                    authenticate(user)
-
-    with register_tab:
-        with st.form("register_form"):
-            username = st.text_input("Choose username", key="register_username")
-            password = st.text_input("Choose password", type="password", key="register_password")
-            submitted = st.form_submit_button("Register", use_container_width=True)
-
-        if submitted:
-            if len(username.strip()) < 3:
-                st.warning("Username must be at least 3 characters.")
-            elif len(password.strip()) < 4:
-                st.warning("Password must be at least 4 characters.")
-            else:
-                user = register_user(username, password)
-                if user:
-                    authenticate(user)
-
-
-def render_chat_screen() -> None:
-    user = st.session_state.user
-    username = escape(user["username"])
-    conversation_id = st.session_state.conversation_id or f"default-{user['id']}"
-    st.session_state.conversation_id = conversation_id
-
-    st.markdown(
-        f"""
-        <div class="topbar">
-            <div class="brand">Chat<span> Bro</span></div>
-            <div class="user-pill">Logged in as {username}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.markdown(
-        """
-        <div class="chat-intro">
-            <strong>Chat Bro is online.</strong> Ask a question, test the flow, or describe what you want to build next.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    refresh_col, spacer_col, logout_col = st.columns([1, 6, 1])
-    with refresh_col:
-        if st.button("Refresh", use_container_width=True):
-            st.session_state.should_scroll_bottom = False
-            st.rerun()
-    with logout_col:
-        if st.button("Logout", use_container_width=True):
-            st.session_state.user = None
-            st.session_state.is_authenticated = False
-            st.session_state.conversation_id = None
-            st.rerun()
-
-    messages = fetch_messages(user["id"], conversation_id)
+def render_message_area_content(user_id: int, conversation_id: str, auto_rerun_typing: bool) -> None:
+    messages = fetch_messages(user_id, conversation_id)
     if messages is None:
         st.stop()
 
@@ -919,32 +1174,329 @@ def render_chat_screen() -> None:
             unsafe_allow_html=True,
         )
     else:
-        render_messages(messages, user["id"], show_typing)
+        render_messages(messages, user_id, show_typing)
         scroll_messages_to_bottom(st.session_state.should_scroll_bottom or show_typing)
         st.session_state.should_scroll_bottom = False
 
-    if show_typing:
+    if show_typing and auto_rerun_typing:
         rerun_while_typing()
 
-    with st.form("send_message_form", clear_on_submit=True):
-        input_col, send_col = st.columns([6, 1])
-        with input_col:
-            content = st.text_input(
-                "Message",
-                placeholder="Message Chat Bro...",
+
+streamlit_fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
+
+if streamlit_fragment:
+
+    @streamlit_fragment(run_every=f"{POLLING_INTERVAL_SECONDS}s")
+    def render_polled_message_area(user_id: int, conversation_id: str) -> None:
+        render_message_area_content(user_id, conversation_id, auto_rerun_typing=False)
+
+
+else:
+
+    def render_polled_message_area(user_id: int, conversation_id: str) -> None:
+        render_message_area_content(user_id, conversation_id, auto_rerun_typing=True)
+
+
+def rerun_while_typing() -> None:
+    time.sleep(1.25)
+    st.rerun()
+
+
+def render_auth_screen() -> None:
+    st.markdown(
+        f"""
+        <div class="auth-page"></div>
+        <div class="auth-hero">
+            <h1 class="title">Welcome to {PRODUCT_NAME}</h1>
+            <p class="subtitle">When generations can communicate.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    login_tab, register_tab = st.tabs(["Login", "Register"])
+
+    with login_tab:
+        username_col, _username_spacer = st.columns([9, 1.5], gap="medium")
+        with username_col:
+            username = st.text_input("Username", key="login_username")
+        password_col, visibility_col = st.columns([9, 1.5], gap="medium")
+        with password_col:
+            password = st.text_input(
+                "Password",
+                type="default" if st.session_state.show_login_password else "password",
+                key="login_password",
+                on_change=submit_login_from_fields,
+            )
+        with visibility_col:
+            st.write("")
+            if st.button(
+                " ",
+                key="toggle_login_password",
+                type="tertiary",
+                icon=":material/visibility_off:" if st.session_state.show_login_password else ":material/visibility:",
+                help="Hide password" if st.session_state.show_login_password else "Show password",
+            ):
+                st.session_state.show_login_password = not st.session_state.show_login_password
+                st.rerun()
+
+        if st.button("Login", key="login_submit", use_container_width=True):
+            if not username.strip() or not password.strip():
+                st.warning("Please enter a username and password.")
+            else:
+                user = login_user(username, password)
+                if user:
+                    authenticate(user)
+
+    with register_tab:
+        username_col, _username_spacer = st.columns([9, 1.5], gap="medium")
+        with username_col:
+            username = st.text_input("Choose username", key="register_username")
+        password_col, visibility_col = st.columns([9, 1.5], gap="medium")
+        with password_col:
+            password = st.text_input(
+                "Choose password",
+                type="default" if st.session_state.show_register_password else "password",
+                key="register_password",
+                on_change=submit_register_from_fields,
+            )
+        with visibility_col:
+            st.write("")
+            if st.button(
+                " ",
+                key="toggle_register_password",
+                type="tertiary",
+                icon=":material/visibility_off:" if st.session_state.show_register_password else ":material/visibility:",
+                help="Hide password" if st.session_state.show_register_password else "Show password",
+            ):
+                st.session_state.show_register_password = not st.session_state.show_register_password
+                st.rerun()
+
+        if st.button("Register", key="register_submit", use_container_width=True):
+            if len(username.strip()) < 3:
+                st.warning("Username must be at least 3 characters.")
+            elif len(password.strip()) < 4:
+                st.warning("Password must be at least 4 characters.")
+            else:
+                user = register_user(username, password)
+                if user:
+                    authenticate(user)
+
+
+def select_conversation(conversation: dict[str, Any], *, scroll_bottom: bool = True) -> None:
+    st.session_state.selected_conversation_id = conversation["id"]
+    st.session_state.conversation_id = conversation["conversation_id"]
+    st.session_state.should_scroll_bottom = scroll_bottom
+    st.query_params["conversation_id"] = conversation["conversation_id"]
+
+
+def resolve_active_conversation(conversations: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not conversations:
+        return None
+
+    active_key = st.session_state.conversation_id
+    active = next((conversation for conversation in conversations if conversation["conversation_id"] == active_key), None)
+    if not active:
+        active = conversations[0]
+        select_conversation(active)
+    else:
+        st.session_state.selected_conversation_id = active["id"]
+    return active
+
+
+def render_conversation_list(conversations: list[dict[str, Any]]) -> dict[str, Any] | None:
+    st.markdown('<p class="sidebar-title">Conversations</p>', unsafe_allow_html=True)
+    st.markdown(
+        '<p class="sidebar-caption">Your saved chats stay here after refresh.</p>',
+        unsafe_allow_html=True,
+    )
+
+    active = resolve_active_conversation(conversations)
+    if not active:
+        st.info("No conversations yet.")
+        return None
+
+    conversation_keys = [conversation["conversation_id"] for conversation in conversations]
+    labels = {conversation["conversation_id"]: conversation_label(conversation) for conversation in conversations}
+    with st.container(height=258, border=False):
+        selected_key = st.radio(
+            "Conversations",
+            conversation_keys,
+            index=conversation_keys.index(active["conversation_id"]),
+            format_func=lambda key: labels[key],
+            label_visibility="collapsed",
+        )
+
+    if selected_key != st.session_state.conversation_id:
+        selected_conversation = next(
+            conversation for conversation in conversations if conversation["conversation_id"] == selected_key
+        )
+        select_conversation(selected_conversation)
+        st.rerun()
+
+    return active
+
+
+def render_search_panel(user_id: int) -> None:
+    with st.form("search_form", clear_on_submit=False):
+        search_input_col, search_button_col = st.columns([5, 1], gap="small")
+        with search_input_col:
+            query = st.text_input(
+                "Search chats or messages",
+                key="search_query",
+                placeholder="Search chats or messages...",
                 label_visibility="collapsed",
             )
-        with send_col:
-            submitted = st.form_submit_button("Send", use_container_width=True)
+        with search_button_col:
+            search_submitted = st.form_submit_button(
+                " ",
+                icon=":material/search:",
+                use_container_width=True,
+                help="Search",
+            )
+    search_query = query.strip()
+    if not search_query:
+        st.session_state.search_results = None
+        return
 
-    if submitted:
-        if not content.strip():
-            st.warning("Message cannot be empty.")
-        else:
-            result = send_message(user["id"], content, conversation_id)
-            if result:
-                st.session_state.should_scroll_bottom = True
+    if search_submitted or st.session_state.search_results is None or st.session_state.last_search_query != search_query:
+        results = search_chats_and_messages(user_id, search_query)
+        if results is not None:
+            st.session_state.search_results = results
+            st.session_state.last_search_query = search_query
+
+    results = st.session_state.search_results
+    if results is None:
+        return
+    conversations = results.get("conversations", []) if isinstance(results, dict) else []
+    messages = results.get("messages", results if isinstance(results, list) else []) if results else []
+    unique_messages = []
+    seen_message_keys = set()
+    for result in messages:
+        content = result.get("message_content") or result.get("content") or ""
+        message_key = (result.get("id"), result.get("conversation_key"), content)
+        fallback_key = (result.get("conversation_key"), result.get("sender_id"), content, result.get("created_at"))
+        dedupe_key = message_key if result.get("id") is not None else fallback_key
+        if dedupe_key in seen_message_keys:
+            continue
+        seen_message_keys.add(dedupe_key)
+        unique_messages.append(result)
+    messages = unique_messages
+
+    if not conversations and not messages:
+        st.info("No matching chats or messages.")
+        return
+
+    for result in conversations:
+        conversation_title = escape(result.get("title", "Conversation"))
+        preview = escape(truncate_text(result.get("last_message"), 90))
+        timestamp = escape(format_timestamp(result["updated_at"]))
+        st.markdown(
+            f"""
+            <div class="search-result">
+                <div class="search-meta"><span class="search-kind">CHAT</span>{timestamp}</div>
+                <div class="search-text"><strong>{conversation_title}</strong><br>{preview}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("Open", key=f"open_search_conversation_{result['id']}", use_container_width=True):
+            st.session_state.selected_conversation_id = result["id"]
+            st.session_state.conversation_id = result["conversation_id"]
+            st.session_state.should_scroll_bottom = True
+            st.rerun()
+
+    for result in messages:
+        message_text = escape(truncate_text(result["message_content"] or result["content"], 120))
+        sender = escape(result.get("sender_username", "unknown"))
+        conversation_title = escape(result.get("conversation_title", "Conversation"))
+        timestamp = escape(format_timestamp(result["created_at"]))
+        st.markdown(
+            f"""
+            <div class="search-result">
+                <div class="search-meta"><span class="search-kind">MESSAGE</span>{conversation_title} · {sender} · {timestamp}</div>
+                <div class="search-text">{message_text}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("Open", key=f"open_search_result_{result['id']}", use_container_width=True):
+            st.session_state.selected_conversation_id = result["conversation_id"]
+            st.session_state.conversation_id = result["conversation_key"]
+            st.session_state.should_scroll_bottom = True
+            st.rerun()
+
+
+def render_chat_screen() -> None:
+    user = st.session_state.user
+    username = escape(user["username"])
+    conversations = fetch_conversations(user["id"])
+    if conversations is None:
+        st.stop()
+
+    st.markdown(
+        f"""
+        <div class="topbar">
+            <div class="brand">Chat<span> Bro</span></div>
+            <div class="topbar-message" dir="rtl">Chat Bro מחובר. שאל שאלה, בדוק את הזרימה, והתחל שיחה.</div>
+            <div class="user-pill">Logged in as {username}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    sidebar_col, chat_col = st.columns([1.25, 3.75], gap="large")
+    with sidebar_col:
+        active_conversation = render_conversation_list(conversations)
+        render_search_panel(user["id"])
+
+    if not active_conversation:
+        st.stop()
+
+    conversation_id = active_conversation["conversation_id"]
+    with chat_col:
+        new_chat_col, spacer_col, logout_col = st.columns([1.3, 5.7, 1])
+        with new_chat_col:
+            if st.button("New Chat", use_container_width=True):
+                conversation = create_conversation(user["id"])
+                if conversation:
+                    select_conversation(conversation)
+                    st.session_state.search_results = None
+                    st.session_state.should_scroll_bottom = True
+                    st.rerun()
+        with logout_col:
+            if st.button("Logout", use_container_width=True):
+                st.session_state.user = None
+                st.session_state.is_authenticated = False
+                st.session_state.conversation_id = None
+                st.session_state.selected_conversation_id = None
+                st.session_state.show_search = False
+                st.session_state.search_results = None
+                st.session_state.last_search_query = ""
+                st.query_params.clear()
                 st.rerun()
+
+        render_polled_message_area(user["id"], conversation_id)
+
+        with st.form("send_message_form", clear_on_submit=True):
+            input_col, send_col = st.columns([6, 1])
+            with input_col:
+                content = st.text_input(
+                    "Message",
+                    placeholder="Message Chat Bro...",
+                    label_visibility="collapsed",
+                )
+            with send_col:
+                submitted = st.form_submit_button("Send", use_container_width=True)
+
+        if submitted:
+            if not content.strip():
+                st.warning("Message cannot be empty.")
+            else:
+                result = send_message(user["id"], content, conversation_id)
+                if result:
+                    st.session_state.should_scroll_bottom = True
+                    st.rerun()
 
 
 def main() -> None:

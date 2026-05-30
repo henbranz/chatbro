@@ -1,17 +1,16 @@
+import os
 from datetime import datetime
 from typing import Generator
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text, create_engine, inspect, text
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, inspect, text
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
-import os
 
 
-DATABASE_PATH = os.getenv("DATABASE_PATH", "messages.db")
-SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{DATABASE_PATH}")
+SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./messages.db")
 
 engine = create_engine(
     SQLALCHEMY_DATABASE_URL,
-    connect_args={"check_same_thread": False},
+    connect_args={"check_same_thread": False} if SQLALCHEMY_DATABASE_URL.startswith("sqlite") else {},
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine, expire_on_commit=False)
 Base = declarative_base()
@@ -22,6 +21,7 @@ class User(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String(150), unique=True, index=True, nullable=False)
+    password = Column(String(255), nullable=True)
     password_hash = Column(String(255), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
@@ -32,6 +32,35 @@ class User(Base):
         cascade="all, delete-orphan",
         foreign_keys="Message.sender_id",
     )
+
+
+class Conversation(Base):
+    __tablename__ = "conversations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(200), nullable=False)
+    conversation_key = Column(String(100), unique=True, index=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    participants = relationship(
+        "ConversationParticipant",
+        back_populates="conversation",
+        cascade="all, delete-orphan",
+    )
+
+
+class ConversationParticipant(Base):
+    __tablename__ = "conversation_participants"
+    __table_args__ = (UniqueConstraint("conversation_id", "user_id", name="uq_conversation_participant"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    conversation = relationship("Conversation", back_populates="participants")
+    user = relationship("User")
 
 
 class Message(Base):
@@ -61,6 +90,8 @@ def migrate_existing_schema() -> None:
     with engine.begin() as connection:
         if "users" in table_names:
             user_columns = {column["name"] for column in inspector.get_columns("users")}
+            if "password" not in user_columns:
+                connection.execute(text("ALTER TABLE users ADD COLUMN password VARCHAR(255)"))
             if "updated_at" not in user_columns:
                 connection.execute(text("ALTER TABLE users ADD COLUMN updated_at DATETIME"))
                 connection.execute(text("UPDATE users SET updated_at = created_at WHERE updated_at IS NULL"))
@@ -100,6 +131,13 @@ def migrate_existing_schema() -> None:
                         """
                     )
                 )
+
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_messages_user_id ON messages (user_id)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_messages_role ON messages (role)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_messages_conversation_id ON messages (conversation_id)"))
+        connection.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_conversation_participants_user_id ON conversation_participants (user_id)")
+        )
 
 
 def get_db() -> Generator:
