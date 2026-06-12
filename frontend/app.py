@@ -1,4 +1,5 @@
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import time
@@ -16,7 +17,7 @@ import streamlit as st
 API_BASE_URL = os.getenv("CHAT_BRO_API_BASE_URL", "http://127.0.0.1:8000")
 REQUEST_TIMEOUT = 5
 PRODUCT_NAME = "Chat Bro"
-POLLING_INTERVAL_SECONDS = 3
+POLLING_INTERVAL_SECONDS = 1
 LOGO_PATH = Path(__file__).resolve().parent / "assets" / "chat-bro-logo.png"
 
 
@@ -65,6 +66,12 @@ def init_session_state() -> None:
         st.session_state.show_user_info_editor = False
     if "show_user_menu" not in st.session_state:
         st.session_state.show_user_menu = False
+    if "cached_conversations" not in st.session_state:
+        st.session_state.cached_conversations = []
+    if "cached_groups" not in st.session_state:
+        st.session_state.cached_groups = []
+    if "cached_invitations" not in st.session_state:
+        st.session_state.cached_invitations = []
     restore_user_from_url()
 
 
@@ -194,6 +201,9 @@ def authenticate(user: dict[str, Any], *, rerun: bool = True) -> None:
     st.session_state.invite_panel_group_id = None
     st.session_state.show_user_info_editor = False
     st.session_state.show_user_menu = False
+    st.session_state.cached_conversations = []
+    st.session_state.cached_groups = []
+    st.session_state.cached_invitations = []
     st.query_params["user_id"] = str(user["id"])
     st.query_params["username"] = user["username"]
     st.query_params["conversation_id"] = st.session_state.conversation_id
@@ -300,6 +310,26 @@ def send_group_message(sender_id: int, group_id: int, content: str):
         f"/groups/{group_id}/messages",
         json={"sender_id": sender_id, "content": content},
     )
+
+
+def fetch_chat_shell_endpoint(endpoint: str, user_id: int) -> list[dict[str, Any]] | None:
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}{endpoint}",
+            params={"user_id": user_id},
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException:
+        return None
+
+
+def fetch_chat_shell_data(user_id: int) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]] | None]:
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        conversations_future = executor.submit(fetch_chat_shell_endpoint, "/conversations", user_id)
+        groups_future = executor.submit(fetch_chat_shell_endpoint, "/groups/my", user_id)
+        return conversations_future.result(), groups_future.result()
 
 
 @st.cache_data
@@ -651,27 +681,10 @@ def inject_css() -> None:
             color: var(--text);
             letter-spacing: 0;
             line-height: 1;
-            animation: chatbro-float 3.8s ease-in-out infinite;
         }
 
         .brand span {
             color: var(--accent);
-            background: linear-gradient(90deg, var(--accent), #e8a07d, var(--accent));
-            background-size: 220% auto;
-            -webkit-background-clip: text;
-            background-clip: text;
-            -webkit-text-fill-color: transparent;
-            animation: chatbro-shimmer 2.4s linear infinite;
-        }
-
-        @keyframes chatbro-shimmer {
-            0% { background-position: 0% center; }
-            100% { background-position: 220% center; }
-        }
-
-        @keyframes chatbro-float {
-            0%, 100% { transform: translateY(0) scale(1); }
-            50% { transform: translateY(-2px) scale(1.015); }
         }
 
         .user-pill {
@@ -1012,12 +1025,13 @@ def inject_css() -> None:
 
         .messages {
             display: flex;
-            flex-direction: column;
+            flex-direction: column-reverse;
             gap: 12px;
             height: min(58vh, 560px);
             min-height: 360px;
             overflow-y: auto;
-            scroll-behavior: smooth;
+            scroll-behavior: auto;
+            overflow-anchor: none;
             padding: 12px;
             border-radius: 26px;
             background: rgba(255, 253, 248, 0.34);
@@ -1541,50 +1555,54 @@ def install_message_autoscroll() -> None:
         (() => {
             const doc = window.parent && window.parent.document ? window.parent.document : document;
             const view = doc.defaultView || window;
-            const scrollPane = (pane, behavior = "auto") => {
+            const scrollPane = (pane, force = false) => {
                 if (!pane) {
                     return;
                 }
-                pane.scrollTop = pane.scrollHeight;
-                const anchor = pane.querySelector(".message-bottom-anchor");
-                if (anchor) {
-                    anchor.scrollIntoView({ block: "end", behavior });
+                if (!force && doc.__chatBroUserScrolledMessages) {
+                    pane.scrollTop = doc.__chatBroSavedMessageScrollTop || pane.scrollTop;
+                    return;
                 }
-                pane.scrollTop = pane.scrollHeight;
+                pane.scrollTop = 0;
             };
-            const scrollAllMessages = (behavior = "auto") => {
+            const scrollAllMessages = (force = false) => {
                 const panes = doc.querySelectorAll(".messages");
                 if (!panes.length) {
                     return;
                 }
-                panes.forEach((pane) => scrollPane(pane, behavior));
-                const page = doc.scrollingElement || doc.documentElement;
-                if (page) {
-                    page.scrollTop = page.scrollHeight;
-                }
+                panes.forEach((pane) => {
+                    scrollPane(pane, force);
+                });
             };
-            const scheduleScroll = (behavior = "auto") => {
-                view.requestAnimationFrame(() => scrollAllMessages(behavior));
-                [40, 120, 260, 520, 900, 1400].forEach((delay) => {
-                    view.setTimeout(() => scrollAllMessages(behavior), delay);
+            const scheduleScroll = (force = false) => {
+                if (force) {
+                    doc.__chatBroUserScrolledMessages = false;
+                    doc.__chatBroSavedMessageScrollTop = 0;
+                }
+                view.requestAnimationFrame(() => scrollAllMessages(force));
+                [25, 75, 160, 320, 650, 1100, 1800].forEach((delay) => {
+                    view.setTimeout(() => scrollAllMessages(force), delay);
                 });
             };
 
             doc.__chatBroScrollToBottom = scheduleScroll;
-            let lastSignature = "";
-            const signatureForMessages = () => {
-                return Array.from(doc.querySelectorAll(".messages")).map((pane) => {
-                    return `${pane.scrollHeight}:${pane.children.length}:${pane.textContent.length}`;
-                }).join("|");
+            const bindScrollMemory = () => {
+                doc.querySelectorAll(".messages").forEach((pane) => {
+                    if (pane.dataset.chatBroScrollMemory === "true") {
+                        return;
+                    }
+                    pane.dataset.chatBroScrollMemory = "true";
+                    pane.addEventListener("scroll", () => {
+                        const userScrolled = Math.abs(pane.scrollTop) > 24;
+                        pane.dataset.chatBroUserScrolled = userScrolled ? "true" : "false";
+                        doc.__chatBroUserScrolledMessages = userScrolled;
+                        doc.__chatBroSavedMessageScrollTop = userScrolled ? pane.scrollTop : 0;
+                    }, { passive: true });
+                });
             };
-            window.setInterval(() => {
-                const signature = signatureForMessages();
-                if (signature && signature !== lastSignature) {
-                    lastSignature = signature;
-                    scheduleScroll("smooth");
-                }
-            }, 450);
-            scheduleScroll("auto");
+            bindScrollMemory();
+            view.setInterval(bindScrollMemory, 1000);
+            scheduleScroll(false);
         })();
         </script>
         """,
@@ -1708,12 +1726,13 @@ def render_messages(
     current_user_id: int,
     show_typing: bool,
 ) -> None:
-    messages_html = "\n".join(message_bubble_html(message, current_user_id) for message in messages)
+    message_items = [message_bubble_html(message, current_user_id) for message in messages]
     if show_typing:
-        messages_html = f"{messages_html}\n{typing_indicator_html()}"
+        message_items.append(typing_indicator_html())
+    messages_html = "\n".join(reversed(message_items))
 
     st.markdown(
-        f'<div class="messages">{messages_html}<div class="message-bottom-anchor"></div></div>',
+        f'<div class="messages"><div class="message-bottom-anchor"></div>{messages_html}</div>',
         unsafe_allow_html=True,
     )
 
@@ -1724,44 +1743,45 @@ def render_group_messages(
     show_bot_typing: bool,
     typing_users: list[dict[str, Any]],
 ) -> None:
-    messages_html = "\n".join(group_message_bubble_html(message, current_user_id) for message in messages)
+    message_items = [group_message_bubble_html(message, current_user_id) for message in messages]
     if show_bot_typing:
-        messages_html = f"{messages_html}\n{typing_indicator_html('Chat Bro is typing')}"
+        message_items.append(typing_indicator_html("Chat Bro is typing"))
     if typing_users:
         names = ", ".join(user["username"] for user in typing_users[:3])
         verb = "are" if len(typing_users) > 1 else "is"
-        messages_html = f"{messages_html}\n{typing_indicator_html(f'{names} {verb} typing')}"
+        message_items.append(typing_indicator_html(f"{names} {verb} typing"))
+    messages_html = "\n".join(reversed(message_items))
     st.markdown(
-        f'<div class="messages">{messages_html}<div class="message-bottom-anchor"></div></div>',
+        f'<div class="messages"><div class="message-bottom-anchor"></div>{messages_html}</div>',
         unsafe_allow_html=True,
     )
 
 
 def scroll_messages_to_bottom(force: bool) -> None:
-    behavior = "smooth" if force else "auto"
+    force_js = "true" if force else "false"
     st.html(
         f"""
         <script>
         (() => {{
+        const forceScroll = {force_js};
         const scrollLatestMessages = () => {{
             const doc = window.parent && window.parent.document ? window.parent.document : document;
+            if (forceScroll) {{
+                doc.__chatBroUserScrolledMessages = false;
+                doc.__chatBroSavedMessageScrollTop = 0;
+            }}
             if (doc.__chatBroScrollToBottom) {{
-                doc.__chatBroScrollToBottom("{behavior}");
+                doc.__chatBroScrollToBottom(forceScroll);
                 return;
             }}
             const containers = doc.querySelectorAll('.messages');
             const latest = containers[containers.length - 1];
-            if (latest) {{
-                latest.scrollTop = latest.scrollHeight;
-                const anchor = latest.querySelector('.message-bottom-anchor');
-                if (anchor) {{
-                    anchor.scrollIntoView({{ block: 'end', behavior: "{behavior}" }});
-                }}
-                latest.scrollTop = latest.scrollHeight;
+            if (latest && (forceScroll || !doc.__chatBroUserScrolledMessages)) {{
+                latest.scrollTop = 0;
             }}
         }};
         window.requestAnimationFrame(scrollLatestMessages);
-        [40, 120, 260, 520, 900].forEach((delay) => setTimeout(scrollLatestMessages, delay));
+        [25, 75, 160, 320, 650, 1100, 1800].forEach((delay) => setTimeout(scrollLatestMessages, delay));
         }})();
         </script>
         """,
@@ -1778,51 +1798,108 @@ def render_group_typing_capture(user_id: int, group_id: int) -> None:
             const apiBaseUrl = {api_base_url};
             const userId = {user_id};
             const groupId = {group_id};
-            const inputs = Array.from(
-                window.parent.document.querySelectorAll('input[placeholder="Message Chat Bro..."]')
-            );
-            const input = inputs[inputs.length - 1];
-            if (!input || input.dataset.chatBroTypingGroup === String(groupId)) {{
-                return;
-            }}
-            if (input.chatBroTypingCleanup) {{
-                input.chatBroTypingCleanup();
-            }}
-            input.dataset.chatBroTypingGroup = String(groupId);
-            let idleTimer = null;
-            let lastSentAt = 0;
-            const sendTyping = (isTyping) => {{
-                const now = Date.now();
-                if (isTyping && now - lastSentAt < 1000) {{
+            const doc = window.parent && window.parent.document ? window.parent.document : document;
+            const view = doc.defaultView || window;
+
+            const sendTyping = (() => {{
+                let lastSentAt = 0;
+                let lastState = null;
+                return (isTyping, force = false) => {{
+                    const now = Date.now();
+                    if (!force && isTyping && lastState === true && now - lastSentAt < 800) {{
+                        return;
+                    }}
+                    if (!force && !isTyping && lastState === false && now - lastSentAt < 800) {{
+                        return;
+                    }}
+                    lastSentAt = now;
+                    lastState = isTyping;
+                    fetch(`${{apiBaseUrl}}/groups/${{groupId}}/typing`, {{
+                        method: "POST",
+                        headers: {{ "Content-Type": "application/json" }},
+                        body: JSON.stringify({{ user_id: userId, is_typing: isTyping }}),
+                        keepalive: true,
+                    }}).catch(() => {{}});
+                }};
+            }})();
+
+            const attachToInput = (input) => {{
+                if (!input || input.dataset.chatBroTypingGroup === String(groupId)) {{
                     return;
                 }}
-                lastSentAt = now;
-                fetch(`${{apiBaseUrl}}/groups/${{groupId}}/typing`, {{
-                    method: "POST",
-                    headers: {{ "Content-Type": "application/json" }},
-                    body: JSON.stringify({{ user_id: userId, is_typing: isTyping }}),
-                    keepalive: true,
-                }}).catch(() => {{}});
-            }};
-            const onInput = () => {{
-                sendTyping(true);
-                window.clearTimeout(idleTimer);
-                idleTimer = window.setTimeout(() => sendTyping(false), 2200);
-            }};
-            const onBlur = () => sendTyping(false);
-            const onKeydown = (event) => {{
-                if (event.key === "Enter") {{
-                    window.setTimeout(() => sendTyping(false), 0);
+                if (input.chatBroTypingCleanup) {{
+                    input.chatBroTypingCleanup();
                 }}
+                input.dataset.chatBroTypingGroup = String(groupId);
+                let idleTimer = null;
+                let heartbeatTimer = null;
+                const startHeartbeat = () => {{
+                    if (!heartbeatTimer) {{
+                        heartbeatTimer = view.setInterval(() => sendTyping(true), 1500);
+                    }}
+                }};
+                const stopHeartbeat = () => {{
+                    if (heartbeatTimer) {{
+                        view.clearInterval(heartbeatTimer);
+                        heartbeatTimer = null;
+                    }}
+                }};
+                const onInput = () => {{
+                    if (!input.value) {{
+                        stopHeartbeat();
+                        sendTyping(false, true);
+                        return;
+                    }}
+                    sendTyping(true);
+                    startHeartbeat();
+                    view.clearTimeout(idleTimer);
+                    idleTimer = view.setTimeout(() => {{
+                        stopHeartbeat();
+                        sendTyping(false, true);
+                    }}, 3200);
+                }};
+                const onBlur = () => {{
+                    stopHeartbeat();
+                    sendTyping(false, true);
+                }};
+                const onKeydown = (event) => {{
+                    if (event.key === "Enter") {{
+                        view.setTimeout(() => {{
+                            stopHeartbeat();
+                            sendTyping(false, true);
+                        }}, 0);
+                    }}
+                }};
+                input.addEventListener("input", onInput);
+                input.addEventListener("blur", onBlur);
+                input.addEventListener("keydown", onKeydown);
+                input.chatBroTypingCleanup = () => {{
+                    input.removeEventListener("input", onInput);
+                    input.removeEventListener("blur", onBlur);
+                    input.removeEventListener("keydown", onKeydown);
+                    stopHeartbeat();
+                }};
             }};
-            input.addEventListener("input", onInput);
-            input.addEventListener("blur", onBlur);
-            input.addEventListener("keydown", onKeydown);
-            input.chatBroTypingCleanup = () => {{
-                input.removeEventListener("input", onInput);
-                input.removeEventListener("blur", onBlur);
-                input.removeEventListener("keydown", onKeydown);
+
+            const findMessageInput = () => {{
+                const inputs = Array.from(doc.querySelectorAll('input[placeholder="Message Chat Bro..."]'));
+                return inputs[inputs.length - 1] || null;
             }};
+            const bindLatestInput = () => attachToInput(findMessageInput());
+            bindLatestInput();
+
+            if (doc.__chatBroTypingInputWatcher) {{
+                view.clearInterval(doc.__chatBroTypingInputWatcher);
+            }}
+            doc.__chatBroTypingInputWatcher = view.setInterval(bindLatestInput, 700);
+
+            view.addEventListener("beforeunload", () => {{
+                const input = findMessageInput();
+                if (input && input.chatBroTypingCleanup) {{
+                    input.chatBroTypingCleanup();
+                }}
+                sendTyping(false, true);
+            }});
         }})();
         </script>
         """,
@@ -1844,7 +1921,7 @@ def render_message_area_content(user_id: int, conversation_id: str, auto_rerun_t
         )
     else:
         render_messages(messages, user_id, show_typing)
-        scroll_messages_to_bottom(True)
+        scroll_messages_to_bottom(st.session_state.should_scroll_bottom)
         st.session_state.should_scroll_bottom = False
 
     if show_typing and auto_rerun_typing:
@@ -1868,7 +1945,7 @@ def render_group_message_area_content(user_id: int, group_id: int) -> None:
         return
 
     render_group_messages(st.session_state.group_messages, user_id, show_bot_typing, typing_users)
-    scroll_messages_to_bottom(True)
+    scroll_messages_to_bottom(st.session_state.should_scroll_bottom)
     st.session_state.should_scroll_bottom = False
 
 
@@ -2115,6 +2192,8 @@ def render_group_list(groups: list[dict[str, Any]]) -> dict[str, Any] | None:
 def render_invitations(user_id: int, invitations: list[dict[str, Any]] | None = None) -> None:
     if invitations is None:
         invitations = fetch_invitations(user_id)
+    if invitations is not None:
+        st.session_state.cached_invitations = invitations
     if invitations is None or not invitations:
         return
 
@@ -2154,14 +2233,15 @@ def render_invitations(user_id: int, invitations: list[dict[str, Any]] | None = 
 if streamlit_fragment:
 
     @streamlit_fragment(run_every=f"{POLLING_INTERVAL_SECONDS}s")
-    def render_polled_invitations(user_id: int) -> None:
-        render_invitations(user_id)
+    def render_polled_invitations(user_id: int, fallback: list[dict[str, Any]] | None = None) -> None:
+        invitations = fetch_invitations(user_id)
+        render_invitations(user_id, invitations if invitations is not None else fallback)
 
 
 else:
 
-    def render_polled_invitations(user_id: int) -> None:
-        render_invitations(user_id)
+    def render_polled_invitations(user_id: int, fallback: list[dict[str, Any]] | None = None) -> None:
+        render_invitations(user_id, fallback)
 
 
 def render_search_panel(user_id: int) -> None:
@@ -2348,6 +2428,9 @@ def logout_user() -> None:
     st.session_state.show_search = False
     st.session_state.search_results = None
     st.session_state.last_search_query = ""
+    st.session_state.cached_conversations = []
+    st.session_state.cached_groups = []
+    st.session_state.cached_invitations = []
     st.query_params.clear()
     st.rerun()
 
@@ -2502,13 +2585,6 @@ def render_group_chat_main(user: dict[str, Any], active_group: dict[str, Any]) -
 
 def render_chat_screen() -> None:
     user = st.session_state.user
-    conversations = fetch_conversations(user["id"])
-    if conversations is None:
-        st.stop()
-    groups = fetch_groups(user["id"])
-    if groups is None:
-        st.stop()
-
     brand_col, message_col, user_menu_col = st.columns([1.4, 4.4, 1.3], gap="small")
     with brand_col:
         st.markdown(
@@ -2527,8 +2603,25 @@ def render_chat_screen() -> None:
     active_conversation = None
     active_group = None
     with sidebar_col:
+        sidebar_placeholder = st.container()
+
+    with chat_col:
+        chat_placeholder = st.container()
+
+    conversations, groups = fetch_chat_shell_data(user["id"])
+    if conversations is None:
+        conversations = st.session_state.cached_conversations
+    else:
+        st.session_state.cached_conversations = conversations
+
+    if groups is None:
+        groups = st.session_state.cached_groups
+    else:
+        st.session_state.cached_groups = groups
+
+    with sidebar_placeholder:
         render_search_panel(user["id"])
-        render_polled_invitations(user["id"])
+        render_polled_invitations(user["id"], st.session_state.cached_invitations)
         with st.expander("MyChat", expanded=True):
             active_conversation = render_conversation_list(conversations)
         with st.expander("MyGroups", expanded=st.session_state.active_chat_type == "group"):
@@ -2539,9 +2632,14 @@ def render_chat_screen() -> None:
         st.session_state.active_chat_type = "single"
 
     if st.session_state.active_chat_type == "single" and not active_conversation:
-        st.stop()
+        with chat_placeholder:
+            st.markdown(
+                '<div class="empty-state">Your chat is loading...</div>',
+                unsafe_allow_html=True,
+            )
+        return
 
-    with chat_col:
+    with chat_placeholder:
         if st.session_state.active_chat_type == "group" and active_group:
             render_group_chat_main(user, active_group)
         elif active_conversation:

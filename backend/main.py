@@ -832,7 +832,7 @@ def create_background_bot_reply(
     content: str,
     conversation_id: str,
 ) -> None:
-    time.sleep(0.8)
+    time.sleep(0.2)
     db = SessionLocal()
     try:
         bot = get_or_create_bot_user(db)
@@ -851,7 +851,7 @@ def create_background_group_bot_reply(
     username: str,
     content: str,
 ) -> None:
-    time.sleep(0.8)
+    time.sleep(0.2)
     db = SessionLocal()
     try:
         get_or_create_bot_user(db)
@@ -1111,7 +1111,7 @@ def get_group_typing_statuses(
     group = get_group(db, group_id)
     require_group_member(db, group.id, user.id)
 
-    cutoff = datetime.utcnow() - timedelta(seconds=6)
+    cutoff = datetime.utcnow() - timedelta(seconds=10)
     db.query(GroupTypingStatus).filter(GroupTypingStatus.updated_at < cutoff).delete(synchronize_session=False)
     statuses = (
         db.query(GroupTypingStatus)
