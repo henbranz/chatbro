@@ -1,4 +1,5 @@
 import base64
+import json
 import os
 import time
 from datetime import datetime
@@ -44,10 +45,26 @@ def init_session_state() -> None:
         st.session_state.search_results = None
     if "last_search_query" not in st.session_state:
         st.session_state.last_search_query = ""
+    if "active_chat_type" not in st.session_state:
+        st.session_state.active_chat_type = "single"
+    if "selected_group_id" not in st.session_state:
+        st.session_state.selected_group_id = None
+    if "group_messages" not in st.session_state:
+        st.session_state.group_messages = []
+    if "group_last_message_id" not in st.session_state:
+        st.session_state.group_last_message_id = 0
+    if "group_messages_group_id" not in st.session_state:
+        st.session_state.group_messages_group_id = None
     if "show_login_password" not in st.session_state:
         st.session_state.show_login_password = False
     if "show_register_password" not in st.session_state:
         st.session_state.show_register_password = False
+    if "invite_panel_group_id" not in st.session_state:
+        st.session_state.invite_panel_group_id = None
+    if "show_user_info_editor" not in st.session_state:
+        st.session_state.show_user_info_editor = False
+    if "show_user_menu" not in st.session_state:
+        st.session_state.show_user_menu = False
     restore_user_from_url()
 
 
@@ -73,6 +90,13 @@ def restore_user_from_url() -> None:
     }
     st.session_state.is_authenticated = True
     st.session_state.conversation_id = st.query_params.get("conversation_id") or f"default-{resolved_user_id}"
+    st.session_state.active_chat_type = st.query_params.get("chat_type") or "single"
+    group_id = st.query_params.get("group_id")
+    if group_id:
+        try:
+            st.session_state.selected_group_id = int(group_id)
+        except ValueError:
+            st.session_state.selected_group_id = None
 
 
 def get_error_detail(response: requests.Response) -> str:
@@ -112,12 +136,25 @@ def api_request(method: str, endpoint: str, **kwargs: Any):
     return response.json() if response.content else None
 
 
-def register_user(username: str, password: str):
-    return api_request("POST", "/register", json={"username": username, "password": password})
+def register_user(username: str, email: str, password: str):
+    return api_request("POST", "/register", json={"username": username, "email": email, "password": password})
 
 
 def login_user(username: str, password: str):
     return api_request("POST", "/login", json={"username": username, "password": password})
+
+
+def fetch_user_profile(user_id: int):
+    return api_request("GET", f"/users/{user_id}")
+
+
+def update_user_profile(user_id: int, username: str, email: str):
+    return api_request("PATCH", f"/users/{user_id}", json={"username": username, "email": email})
+
+
+def looks_like_email(email: str) -> bool:
+    local, separator, domain = email.strip().partition("@")
+    return bool(local and separator and "." in domain and not domain.startswith(".") and not domain.endswith("."))
 
 
 def submit_login_from_fields() -> None:
@@ -131,9 +168,10 @@ def submit_login_from_fields() -> None:
 
 def submit_register_from_fields() -> None:
     username = st.session_state.get("register_username", "").strip()
+    email = st.session_state.get("register_email", "").strip()
     password = st.session_state.get("register_password", "").strip()
-    if len(username) >= 3 and len(password) >= 4:
-        user = register_user(username, password)
+    if len(username) >= 3 and looks_like_email(email) and len(password) >= 4:
+        user = register_user(username, email, password)
         if user:
             authenticate(user, rerun=False)
 
@@ -148,9 +186,20 @@ def authenticate(user: dict[str, Any], *, rerun: bool = True) -> None:
     st.session_state.search_query = ""
     st.session_state.search_results = None
     st.session_state.last_search_query = ""
+    st.session_state.active_chat_type = "single"
+    st.session_state.selected_group_id = None
+    st.session_state.group_messages = []
+    st.session_state.group_last_message_id = 0
+    st.session_state.group_messages_group_id = None
+    st.session_state.invite_panel_group_id = None
+    st.session_state.show_user_info_editor = False
+    st.session_state.show_user_menu = False
     st.query_params["user_id"] = str(user["id"])
     st.query_params["username"] = user["username"]
     st.query_params["conversation_id"] = st.session_state.conversation_id
+    st.query_params["chat_type"] = "single"
+    if "group_id" in st.query_params:
+        del st.query_params["group_id"]
     if rerun:
         st.rerun()
 
@@ -191,6 +240,68 @@ def fetch_gemini_status(user_id: int):
     return api_request("GET", "/settings/gemini", params={"user_id": user_id})
 
 
+def create_group(user_id: int, name: str):
+    return api_request("POST", "/groups/create", json={"user_id": user_id, "name": name})
+
+
+def fetch_groups(user_id: int):
+    return api_request("GET", "/groups/my", params={"user_id": user_id})
+
+
+def invite_user_to_group(group_id: int, inviter_user_id: int, invited_identity: str):
+    identity = invited_identity.strip()
+    payload: dict[str, Any] = {"inviter_user_id": inviter_user_id}
+    if "@" in identity:
+        payload["invited_email"] = identity.lower()
+    elif identity.startswith("#") and identity[1:].isdigit():
+        payload["invited_user_id"] = int(identity[1:])
+    else:
+        payload["invited_username"] = identity
+    return api_request(
+        "POST",
+        f"/groups/{group_id}/invite",
+        json=payload,
+    )
+
+
+def fetch_invitations(user_id: int):
+    return api_request("GET", "/invitations/my", params={"user_id": user_id})
+
+
+def accept_invitation(invitation_id: int, user_id: int):
+    return api_request("POST", f"/invitations/{invitation_id}/accept", json={"user_id": user_id})
+
+
+def decline_invitation(invitation_id: int, user_id: int):
+    return api_request("POST", f"/invitations/{invitation_id}/decline", json={"user_id": user_id})
+
+
+def fetch_group_messages(user_id: int, group_id: int, after_id: int | None = None):
+    if after_id:
+        return api_request(
+            "GET",
+            f"/groups/{group_id}/messages/new",
+            params={"user_id": user_id, "after_id": after_id, "limit": 100},
+        )
+    return api_request(
+        "GET",
+        f"/groups/{group_id}/messages",
+        params={"user_id": user_id, "limit": 100},
+    )
+
+
+def fetch_group_typing(user_id: int, group_id: int):
+    return api_request("GET", f"/groups/{group_id}/typing", params={"user_id": user_id})
+
+
+def send_group_message(sender_id: int, group_id: int, content: str):
+    return api_request(
+        "POST",
+        f"/groups/{group_id}/messages",
+        json={"sender_id": sender_id, "content": content},
+    )
+
+
 @st.cache_data
 def logo_background_value() -> str:
     if not LOGO_PATH.exists():
@@ -222,6 +333,35 @@ def conversation_label(conversation: dict[str, Any]) -> str:
     preview = truncate_text(conversation.get("last_message"), 48)
     updated_at = format_timestamp(conversation["updated_at"])
     return f"{conversation['title']}  ·  {preview}  ·  {updated_at}"
+
+
+def group_label(group: dict[str, Any]) -> str:
+    preview = truncate_text(group.get("last_message"), 42)
+    updated_at = format_timestamp(group["updated_at"])
+    member_word = "member" if group["member_count"] == 1 else "members"
+    return f"{group['name']} · {group['member_count']} {member_word} · {preview} · {updated_at}"
+
+
+GROUP_NAME_COLORS = [
+    "#d9772f",
+    "#2e7d76",
+    "#7c5cc4",
+    "#b14f6a",
+    "#5b6f2a",
+    "#bf6a25",
+    "#2f6ea5",
+    "#8a5a2d",
+]
+
+
+def group_sender_color(message: dict[str, Any]) -> str:
+    if message.get("sender_type") == "bot":
+        return "#d9772f"
+    sender_id = message.get("sender_user_id")
+    if isinstance(sender_id, int):
+        return GROUP_NAME_COLORS[sender_id % len(GROUP_NAME_COLORS)]
+    name = message.get("sender_display_name") or ""
+    return GROUP_NAME_COLORS[sum(ord(character) for character in name) % len(GROUP_NAME_COLORS)]
 
 
 def contains_hebrew(value: str) -> bool:
@@ -319,6 +459,7 @@ def inject_css() -> None:
             --user: #2c2620;
             --bot: rgba(255, 250, 241, 0.94);
             --shadow: 0 20px 70px var(--cb-shadow);
+            --ui-radius: 24px;
         }
 
         .stApp {
@@ -466,6 +607,31 @@ def inject_css() -> None:
             backdrop-filter: blur(20px);
         }
 
+        div[data-testid="stHorizontalBlock"]:has(.topbar-brand-block):has(.topbar-message-block) {
+            align-items: center;
+            gap: 16px;
+            padding: 12px 18px;
+            margin-bottom: 18px;
+            background: var(--glass);
+            border: 1px solid var(--line);
+            border-radius: var(--ui-radius);
+            box-shadow: 0 14px 45px rgba(54,43,31,0.08);
+            backdrop-filter: blur(20px);
+        }
+
+        .topbar-brand-block {
+            display: flex;
+            align-items: center;
+            min-height: 44px;
+        }
+
+        .topbar-message-block {
+            min-height: 44px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
         .topbar-message {
             flex: 1;
             color: var(--muted);
@@ -518,6 +684,54 @@ def inject_css() -> None:
             font-weight: 750;
         }
 
+        div[data-testid="stHorizontalBlock"]:has(.topbar-brand-block) div[data-testid="stPopover"] button {
+            min-height: 42px;
+            min-width: 120px;
+            width: auto !important;
+            display: inline-flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            gap: 6px !important;
+            padding: 0 14px !important;
+            line-height: 1 !important;
+            border-radius: var(--ui-radius) !important;
+            border: 1px solid rgba(171,83,31,0.28) !important;
+            background: linear-gradient(135deg, #e88a34, #c96525) !important;
+            color: #fffaf1 !important;
+            font-weight: 850 !important;
+            box-shadow: 0 12px 26px rgba(137,89,42,0.18) !important;
+            white-space: nowrap;
+        }
+
+        div[data-testid="stHorizontalBlock"]:has(.topbar-brand-block) button[data-testid="stPopoverButton"] > div {
+            width: 100% !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            gap: 6px !important;
+        }
+
+        div[data-testid="stHorizontalBlock"]:has(.topbar-brand-block) button[data-testid="stPopoverButton"] div[aria-hidden="true"] {
+            display: inline-flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            line-height: 1 !important;
+        }
+
+        div[data-testid="stHorizontalBlock"]:has(.topbar-brand-block) div[data-testid="stPopover"] button:hover {
+            border-color: rgba(217,119,47,0.30) !important;
+            background: linear-gradient(135deg, #f09b4a, #d9772f) !important;
+            color: #fffaf1 !important;
+        }
+
+        div[data-testid="stHorizontalBlock"]:has(.topbar-brand-block) div[data-testid="stPopover"] button p,
+        div[data-testid="stHorizontalBlock"]:has(.topbar-brand-block) div[data-testid="stPopover"] button svg {
+            margin: 0 !important;
+            line-height: 1 !important;
+        }
+
         .settings-note {
             margin: 0 0 10px;
             color: var(--muted);
@@ -550,6 +764,42 @@ def inject_css() -> None:
             color: var(--muted);
             font-size: 12px;
             line-height: 1.45;
+        }
+
+        div[data-testid="stExpander"] {
+            margin-bottom: 6px;
+            border: 1px solid rgba(137, 89, 42, 0.18);
+            border-radius: var(--ui-radius);
+            background: rgba(255,250,241,0.58);
+            box-shadow: 0 12px 30px rgba(54,43,31,0.06);
+            overflow: hidden;
+        }
+
+        div[data-testid="stExpander"] details {
+            border: 0 !important;
+        }
+
+        div[data-testid="stExpander"] summary {
+            min-height: 46px;
+            padding: 8px 12px;
+            background: rgba(255,250,241,0.96) !important;
+            border-bottom: 1px solid rgba(137, 89, 42, 0.14);
+        }
+
+        div[data-testid="stExpander"] summary,
+        div[data-testid="stExpander"] summary * {
+            color: var(--text) !important;
+            -webkit-text-fill-color: var(--text) !important;
+        }
+
+        div[data-testid="stExpander"] summary p {
+            color: var(--text) !important;
+            font-size: 15px;
+            font-weight: 900;
+        }
+
+        div[data-testid="stExpander"] div[data-testid="stExpanderDetails"] {
+            padding-top: 0;
         }
 
         div[role="radiogroup"] {
@@ -634,6 +884,107 @@ def inject_css() -> None:
             color: #79411e;
             font-size: 10px;
             font-weight: 850;
+        }
+
+        div[class*="st-key-toggle_invite_group_"] button {
+            width: 46px !important;
+            min-width: 46px !important;
+            height: 46px !important;
+            min-height: 46px !important;
+            padding: 0 !important;
+            display: inline-flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            text-align: center !important;
+            line-height: 1 !important;
+            overflow: hidden !important;
+            border-radius: 999px !important;
+            border: 1px solid rgba(217,119,47,0.30) !important;
+            background: rgba(255,250,241,0.86) !important;
+            color: var(--accent) !important;
+            box-shadow: 0 12px 26px rgba(137,89,42,0.10) !important;
+        }
+
+        div[class*="st-key-toggle_invite_group_"] button p,
+        div[class*="st-key-toggle_invite_group_"] button div[data-testid="stMarkdownContainer"],
+        .st-key-toggle_login_password button p,
+        .st-key-toggle_login_password button div[data-testid="stMarkdownContainer"],
+        .st-key-toggle_register_password button p,
+        .st-key-toggle_register_password button div[data-testid="stMarkdownContainer"],
+        div[data-testid="stForm"]:has(input[placeholder="Search chats, groups, emails..."]) div[data-testid="stFormSubmitButton"] button div[data-testid="stMarkdownContainer"],
+        div[data-testid="stForm"]:has(input[placeholder="Search chats, groups, emails..."]) div[data-testid="stFormSubmitButton"] button p {
+            display: none !important;
+            width: 0 !important;
+            min-width: 0 !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            line-height: 0 !important;
+        }
+
+        div[class*="st-key-toggle_invite_group_"] button:hover {
+            transform: translateY(-1px);
+            background: #fffaf1 !important;
+            box-shadow: 0 16px 32px rgba(137,89,42,0.15) !important;
+        }
+
+        div[data-testid="stForm"]:has(input[placeholder="Invite by email..."]) {
+            animation: invite-drawer-in 260ms ease both;
+            transform-origin: top right;
+            margin: 10px auto 16px;
+            max-width: 560px;
+            padding: 8px;
+            border: 1px solid rgba(217,119,47,0.16);
+            border-radius: 24px;
+            background: rgba(255,250,241,0.66);
+            box-shadow: 0 16px 42px rgba(54,43,31,0.08);
+        }
+
+        @keyframes invite-drawer-in {
+            from {
+                opacity: 0;
+                transform: translateY(-8px) scale(0.98);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0) scale(1);
+            }
+        }
+
+        .section-divider {
+            height: 1px;
+            margin: 16px 0 12px;
+            background: rgba(96,76,55,0.14);
+        }
+
+        .group-note,
+        .invitation-card {
+            margin: 8px 0;
+            padding: 10px 12px;
+            border-radius: 16px;
+            background: rgba(255,250,241,0.72);
+            border: 1px solid rgba(96,76,55,0.14);
+            color: var(--text);
+            font-size: 13px;
+            line-height: 1.4;
+        }
+
+        .group-card-active {
+            margin: 8px 0;
+            padding: 10px 12px;
+            border-radius: 16px;
+            background: linear-gradient(135deg, #d9772f, #c96d2c);
+            color: #fffaf1;
+            font-size: 13px;
+            font-weight: 800;
+            box-shadow: 0 12px 26px rgba(137,89,42,0.20);
+        }
+
+        .group-controls {
+            margin-bottom: 12px;
+            padding: 10px 12px;
+            border-radius: 18px;
+            background: rgba(255,250,241,0.58);
+            border: 1px solid rgba(96,76,55,0.12);
         }
 
         .chat-panel {
@@ -770,8 +1121,27 @@ def inject_css() -> None:
             box-shadow: 0 12px 30px rgba(47,42,36,0.16);
         }
 
+        .bubble.system {
+            max-width: min(620px, 82%);
+            background: rgba(245,223,213,0.62);
+            border: 1px solid rgba(201,100,66,0.18);
+            color: #6e4328;
+            text-align: center;
+            font-size: 13px;
+            font-weight: 720;
+            box-shadow: none;
+        }
+
         .sender {
             display: none;
+        }
+
+        .group-sender {
+            display: block;
+            margin-bottom: 5px;
+            font-size: 12px;
+            font-weight: 850;
+            opacity: 1;
         }
 
         .meta {
@@ -791,6 +1161,13 @@ def inject_css() -> None:
             background: var(--bot);
             border: 1px solid var(--line);
             box-shadow: 0 4px 18px rgba(54,43,31,0.05);
+        }
+
+        .typing-label {
+            margin-right: 5px;
+            color: var(--muted);
+            font-size: 12px;
+            font-weight: 820;
         }
 
         .typing-dot {
@@ -841,7 +1218,7 @@ def inject_css() -> None:
             padding: 6px;
         }
 
-        div[data-testid="stForm"]:has(input[placeholder="Search chats or messages..."]) {
+        div[data-testid="stForm"]:has(input[placeholder="Search chats, groups, emails..."]) {
             max-width: none;
             margin: 0 0 14px;
             padding: 0;
@@ -912,13 +1289,13 @@ def inject_css() -> None:
             display: none !important;
         }
 
-        div[data-testid="stTextInput"]:has(input[placeholder="Search chats or messages..."]) div[data-baseweb="input"] {
+        div[data-testid="stTextInput"]:has(input[placeholder="Search chats, groups, emails..."]) div[data-baseweb="input"] {
             border-radius: 999px !important;
             border-color: rgba(217,119,47,0.24) !important;
             background: rgba(255,250,241,0.88) !important;
         }
 
-        div[data-testid="stTextInput"]:has(input[placeholder="Search chats or messages..."]) input {
+        div[data-testid="stTextInput"]:has(input[placeholder="Search chats, groups, emails..."]) input {
             background-image: none !important;
             padding-right: 1rem !important;
         }
@@ -956,11 +1333,49 @@ def inject_css() -> None:
             height: 44px !important;
             min-height: 44px !important;
             padding: 0 !important;
+            display: inline-flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            text-align: center !important;
+            line-height: 1 !important;
+            overflow: hidden !important;
             border-radius: 999px !important;
             background: rgba(255,250,241,0.88) !important;
             border: 1px solid rgba(217,119,47,0.24) !important;
             color: var(--cb-orange) !important;
             box-shadow: 0 6px 16px rgba(55,43,28,0.07) !important;
+        }
+
+        button:has(span[data-testid="stIconMaterial"]) > div,
+        button:has(span[data-testid="stIconMaterial"]) span[data-has-shortcut="false"],
+        button:has(span[data-testid="stIconMaterial"]) span[data-testid="stIconMaterial"] + div,
+        button:has(span[data-testid="stIconMaterial"]) span:has(> span[data-testid="stIconMaterial"]) {
+            display: inline-flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            width: 100% !important;
+            height: 100% !important;
+            min-width: 0 !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            gap: 0 !important;
+            line-height: 1 !important;
+        }
+
+        button:has(span[data-testid="stIconMaterial"]) div[data-testid="stMarkdownContainer"]:empty {
+            display: none !important;
+        }
+
+        button:has(span[data-testid="stIconMaterial"]) span[data-testid="stIconMaterial"] {
+            display: inline-flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            width: 20px !important;
+            height: 20px !important;
+            margin: 0 !important;
+            line-height: 1 !important;
+            font-size: 20px !important;
+            text-align: center !important;
         }
 
         .st-key-toggle_login_password button:has(span[data-testid="stIconMaterial"]),
@@ -974,16 +1389,6 @@ def inject_css() -> None:
             background: rgba(231,161,95,0.18) !important;
             border-color: rgba(217,119,47,0.42) !important;
             color: #a95322 !important;
-        }
-
-        button:has(span[data-testid="stIconMaterial"]) div[data-testid="stMarkdownContainer"] {
-            display: none !important;
-            position: absolute !important;
-            width: 0 !important;
-            height: 0 !important;
-            overflow: hidden !important;
-            clip: rect(0, 0, 0, 0) !important;
-            white-space: nowrap !important;
         }
 
         .stButton > button:hover {
@@ -1001,12 +1406,17 @@ def inject_css() -> None:
             box-shadow: 0 10px 22px rgba(47,42,36,0.16) !important;
         }
 
-        div[data-testid="stForm"]:has(input[placeholder="Search chats or messages..."]) div[data-testid="stFormSubmitButton"] button {
+        div[data-testid="stForm"]:has(input[placeholder="Search chats, groups, emails..."]) div[data-testid="stFormSubmitButton"] button {
             min-width: 44px !important;
             width: 44px !important;
             height: 44px !important;
             min-height: 44px !important;
             padding: 0 !important;
+            display: inline-flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            text-align: center !important;
+            line-height: 1 !important;
             background: rgba(255,250,241,0.88) !important;
             color: var(--cb-orange) !important;
             border-color: rgba(217,119,47,0.24) !important;
@@ -1026,9 +1436,39 @@ def inject_css() -> None:
             align-items: flex-start;
         }
 
+        .stApp div[data-testid="stForm"],
+        .stApp div[data-testid="stTabs"],
+        .stApp div[data-testid="stExpander"],
+        .stApp .auth-hero,
+        .stApp .chat-panel,
+        .stApp .messages,
+        .stApp .empty-state,
+        .stApp .group-note,
+        .stApp .invitation-card,
+        .stApp .group-card-active,
+        .stApp .group-controls,
+        .stApp .bubble,
+        .stApp .typing-bubble,
+        .stApp div[data-baseweb="input"],
+        .stApp .stButton > button,
+        .stApp div[data-testid="stFormSubmitButton"] button,
+        .stApp div[data-testid="stPopover"] button,
+        .stApp button[data-baseweb="tab"] {
+            border-radius: var(--ui-radius) !important;
+        }
+
+        .stApp div[data-testid="stHorizontalBlock"]:has(.topbar-brand-block) div[data-testid="stPopover"] button {
+            min-width: 120px !important;
+            width: auto !important;
+            background: linear-gradient(135deg, #e88a34, #c96525) !important;
+            border-color: rgba(171,83,31,0.28) !important;
+            color: #fffaf1 !important;
+            box-shadow: 0 12px 26px rgba(137,89,42,0.18) !important;
+        }
+
         .stApp:has(.auth-page) [data-testid="stHorizontalBlock"],
         div[data-testid="stForm"]:has(input[placeholder="Message Chat Bro..."]) [data-testid="stHorizontalBlock"],
-        div[data-testid="stForm"]:has(input[placeholder="Search chats or messages..."]) [data-testid="stHorizontalBlock"] {
+        div[data-testid="stForm"]:has(input[placeholder="Search chats, groups, emails..."]) [data-testid="stHorizontalBlock"] {
             align-items: center;
         }
 
@@ -1094,6 +1534,64 @@ def inject_css() -> None:
     )
 
 
+def install_message_autoscroll() -> None:
+    st.html(
+        """
+        <script>
+        (() => {
+            const doc = window.parent && window.parent.document ? window.parent.document : document;
+            const view = doc.defaultView || window;
+            const scrollPane = (pane, behavior = "auto") => {
+                if (!pane) {
+                    return;
+                }
+                pane.scrollTop = pane.scrollHeight;
+                const anchor = pane.querySelector(".message-bottom-anchor");
+                if (anchor) {
+                    anchor.scrollIntoView({ block: "end", behavior });
+                }
+                pane.scrollTop = pane.scrollHeight;
+            };
+            const scrollAllMessages = (behavior = "auto") => {
+                const panes = doc.querySelectorAll(".messages");
+                if (!panes.length) {
+                    return;
+                }
+                panes.forEach((pane) => scrollPane(pane, behavior));
+                const page = doc.scrollingElement || doc.documentElement;
+                if (page) {
+                    page.scrollTop = page.scrollHeight;
+                }
+            };
+            const scheduleScroll = (behavior = "auto") => {
+                view.requestAnimationFrame(() => scrollAllMessages(behavior));
+                [40, 120, 260, 520, 900, 1400].forEach((delay) => {
+                    view.setTimeout(() => scrollAllMessages(behavior), delay);
+                });
+            };
+
+            doc.__chatBroScrollToBottom = scheduleScroll;
+            let lastSignature = "";
+            const signatureForMessages = () => {
+                return Array.from(doc.querySelectorAll(".messages")).map((pane) => {
+                    return `${pane.scrollHeight}:${pane.children.length}:${pane.textContent.length}`;
+                }).join("|");
+            };
+            window.setInterval(() => {
+                const signature = signatureForMessages();
+                if (signature && signature !== lastSignature) {
+                    lastSignature = signature;
+                    scheduleScroll("smooth");
+                }
+            }, 450);
+            scheduleScroll("auto");
+        })();
+        </script>
+        """,
+        unsafe_allow_javascript=True,
+    )
+
+
 def message_bubble_html(message: dict[str, Any], current_user_id: int) -> str:
     is_current_user = message["role"] == "user" and message["sender_id"] == current_user_id
     row_class = "right" if is_current_user else "left"
@@ -1114,10 +1612,89 @@ def message_bubble_html(message: dict[str, Any], current_user_id: int) -> str:
     )
 
 
-def typing_indicator_html() -> str:
+def group_message_bubble_html(message: dict[str, Any], current_user_id: int) -> str:
+    sender_type = message.get("sender_type", "user")
+    is_current_user = sender_type == "user" and message.get("sender_user_id") == current_user_id
+    if sender_type == "system":
+        row_class = "left"
+        bubble_class = "system"
+    else:
+        row_class = "right" if is_current_user else "left"
+        bubble_class = "right" if is_current_user else "left"
+
+    raw_content = message["content"]
+    content = format_message_content(raw_content)
+    created_at = escape(format_timestamp(message["created_at"]))
+    direction = "rtl" if contains_hebrew(raw_content) else "ltr"
+    alignment = "center" if sender_type == "system" else ("right" if direction == "rtl" else "left")
+    sender_name = escape(message.get("sender_display_name") or "Unknown")
+    if sender_type == "bot":
+        sender_name = f"{sender_name} · chatbot"
+    elif sender_type == "system":
+        sender_name = "System"
+
+    sender_color = group_sender_color(message)
+    sender_html = (
+        ""
+        if sender_type == "system"
+        else f'<div class="group-sender" style="color: {sender_color};">{sender_name}</div>'
+    )
+    return (
+        f'<div class="msg-row {row_class}">'
+        f'<div class="bubble {bubble_class}" dir="{direction}" style="text-align: {alignment};">'
+        f"{sender_html}"
+        f'<div class="message-content">{content}</div>'
+        f'<div class="meta">{created_at}</div>'
+        "</div>"
+        "</div>"
+    )
+
+
+def append_group_messages(messages: list[dict[str, Any]]) -> None:
+    existing_ids = {message["id"] for message in st.session_state.group_messages}
+    added = []
+    for message in messages:
+        if message["id"] in existing_ids:
+            continue
+        existing_ids.add(message["id"])
+        added.append(message)
+    if not added:
+        return
+
+    st.session_state.group_messages = sorted(
+        [*st.session_state.group_messages, *added],
+        key=lambda message: message["id"],
+    )
+    st.session_state.group_last_message_id = max(
+        st.session_state.group_last_message_id,
+        *(message["id"] for message in added),
+    )
+
+
+def sync_group_messages(user_id: int, group_id: int) -> bool:
+    if st.session_state.group_messages_group_id != group_id:
+        st.session_state.group_messages = []
+        st.session_state.group_last_message_id = 0
+        st.session_state.group_messages_group_id = group_id
+
+    previous_count = len(st.session_state.group_messages)
+    messages = fetch_group_messages(
+        user_id,
+        group_id,
+        after_id=st.session_state.group_last_message_id or None,
+    )
+    if messages is None:
+        st.stop()
+    append_group_messages(messages)
+    return len(st.session_state.group_messages) > previous_count
+
+
+def typing_indicator_html(label: str = "Chat Bro is typing") -> str:
+    safe_label = escape(label)
     return (
         '<div class="msg-row left">'
-        '<div class="typing-bubble" aria-label="Chat Bro is typing">'
+        f'<div class="typing-bubble" aria-label="{safe_label}">'
+        f'<span class="typing-label">{safe_label}</span>'
         '<span class="typing-dot"></span>'
         '<span class="typing-dot"></span>'
         '<span class="typing-dot"></span>'
@@ -1136,7 +1713,26 @@ def render_messages(
         messages_html = f"{messages_html}\n{typing_indicator_html()}"
 
     st.markdown(
-        f'<div class="messages">{messages_html}</div>',
+        f'<div class="messages">{messages_html}<div class="message-bottom-anchor"></div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_group_messages(
+    messages: list[dict[str, Any]],
+    current_user_id: int,
+    show_bot_typing: bool,
+    typing_users: list[dict[str, Any]],
+) -> None:
+    messages_html = "\n".join(group_message_bubble_html(message, current_user_id) for message in messages)
+    if show_bot_typing:
+        messages_html = f"{messages_html}\n{typing_indicator_html('Chat Bro is typing')}"
+    if typing_users:
+        names = ", ".join(user["username"] for user in typing_users[:3])
+        verb = "are" if len(typing_users) > 1 else "is"
+        messages_html = f"{messages_html}\n{typing_indicator_html(f'{names} {verb} typing')}"
+    st.markdown(
+        f'<div class="messages">{messages_html}<div class="message-bottom-anchor"></div></div>',
         unsafe_allow_html=True,
     )
 
@@ -1146,15 +1742,88 @@ def scroll_messages_to_bottom(force: bool) -> None:
     st.html(
         f"""
         <script>
+        (() => {{
         const scrollLatestMessages = () => {{
-            const containers = window.parent.document.querySelectorAll('.messages');
+            const doc = window.parent && window.parent.document ? window.parent.document : document;
+            if (doc.__chatBroScrollToBottom) {{
+                doc.__chatBroScrollToBottom("{behavior}");
+                return;
+            }}
+            const containers = doc.querySelectorAll('.messages');
             const latest = containers[containers.length - 1];
             if (latest) {{
-                latest.scrollTo({{ top: latest.scrollHeight, behavior: "{behavior}" }});
+                latest.scrollTop = latest.scrollHeight;
+                const anchor = latest.querySelector('.message-bottom-anchor');
+                if (anchor) {{
+                    anchor.scrollIntoView({{ block: 'end', behavior: "{behavior}" }});
+                }}
+                latest.scrollTop = latest.scrollHeight;
             }}
         }};
-        setTimeout(scrollLatestMessages, 80);
-        setTimeout(scrollLatestMessages, 280);
+        window.requestAnimationFrame(scrollLatestMessages);
+        [40, 120, 260, 520, 900].forEach((delay) => setTimeout(scrollLatestMessages, delay));
+        }})();
+        </script>
+        """,
+        unsafe_allow_javascript=True,
+    )
+
+
+def render_group_typing_capture(user_id: int, group_id: int) -> None:
+    api_base_url = json.dumps(API_BASE_URL)
+    st.html(
+        f"""
+        <script>
+        (() => {{
+            const apiBaseUrl = {api_base_url};
+            const userId = {user_id};
+            const groupId = {group_id};
+            const inputs = Array.from(
+                window.parent.document.querySelectorAll('input[placeholder="Message Chat Bro..."]')
+            );
+            const input = inputs[inputs.length - 1];
+            if (!input || input.dataset.chatBroTypingGroup === String(groupId)) {{
+                return;
+            }}
+            if (input.chatBroTypingCleanup) {{
+                input.chatBroTypingCleanup();
+            }}
+            input.dataset.chatBroTypingGroup = String(groupId);
+            let idleTimer = null;
+            let lastSentAt = 0;
+            const sendTyping = (isTyping) => {{
+                const now = Date.now();
+                if (isTyping && now - lastSentAt < 1000) {{
+                    return;
+                }}
+                lastSentAt = now;
+                fetch(`${{apiBaseUrl}}/groups/${{groupId}}/typing`, {{
+                    method: "POST",
+                    headers: {{ "Content-Type": "application/json" }},
+                    body: JSON.stringify({{ user_id: userId, is_typing: isTyping }}),
+                    keepalive: true,
+                }}).catch(() => {{}});
+            }};
+            const onInput = () => {{
+                sendTyping(true);
+                window.clearTimeout(idleTimer);
+                idleTimer = window.setTimeout(() => sendTyping(false), 2200);
+            }};
+            const onBlur = () => sendTyping(false);
+            const onKeydown = (event) => {{
+                if (event.key === "Enter") {{
+                    window.setTimeout(() => sendTyping(false), 0);
+                }}
+            }};
+            input.addEventListener("input", onInput);
+            input.addEventListener("blur", onBlur);
+            input.addEventListener("keydown", onKeydown);
+            input.chatBroTypingCleanup = () => {{
+                input.removeEventListener("input", onInput);
+                input.removeEventListener("blur", onBlur);
+                input.removeEventListener("keydown", onKeydown);
+            }};
+        }})();
         </script>
         """,
         unsafe_allow_javascript=True,
@@ -1175,11 +1844,32 @@ def render_message_area_content(user_id: int, conversation_id: str, auto_rerun_t
         )
     else:
         render_messages(messages, user_id, show_typing)
-        scroll_messages_to_bottom(st.session_state.should_scroll_bottom or show_typing)
+        scroll_messages_to_bottom(True)
         st.session_state.should_scroll_bottom = False
 
     if show_typing and auto_rerun_typing:
         rerun_while_typing()
+
+
+def render_group_message_area_content(user_id: int, group_id: int) -> None:
+    has_new_messages = sync_group_messages(user_id, group_id)
+    typing_users = fetch_group_typing(user_id, group_id)
+    if typing_users is None:
+        typing_users = []
+    show_bot_typing = bool(
+        st.session_state.group_messages
+        and st.session_state.group_messages[-1].get("sender_type") == "user"
+    )
+    if not st.session_state.group_messages and not typing_users and not show_bot_typing:
+        st.markdown(
+            '<div class="empty-state">No group messages yet. Send the first one below.</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    render_group_messages(st.session_state.group_messages, user_id, show_bot_typing, typing_users)
+    scroll_messages_to_bottom(True)
+    st.session_state.should_scroll_bottom = False
 
 
 streamlit_fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
@@ -1190,11 +1880,18 @@ if streamlit_fragment:
     def render_polled_message_area(user_id: int, conversation_id: str) -> None:
         render_message_area_content(user_id, conversation_id, auto_rerun_typing=False)
 
+    @streamlit_fragment(run_every=f"{POLLING_INTERVAL_SECONDS}s")
+    def render_polled_group_message_area(user_id: int, group_id: int) -> None:
+        render_group_message_area_content(user_id, group_id)
+
 
 else:
 
     def render_polled_message_area(user_id: int, conversation_id: str) -> None:
         render_message_area_content(user_id, conversation_id, auto_rerun_typing=True)
+
+    def render_polled_group_message_area(user_id: int, group_id: int) -> None:
+        render_group_message_area_content(user_id, group_id)
 
 
 def rerun_while_typing() -> None:
@@ -1226,7 +1923,6 @@ def render_auth_screen() -> None:
                 "Password",
                 type="default" if st.session_state.show_login_password else "password",
                 key="login_password",
-                on_change=submit_login_from_fields,
             )
         with visibility_col:
             st.write("")
@@ -1252,13 +1948,15 @@ def render_auth_screen() -> None:
         username_col, _username_spacer = st.columns([9, 1.5], gap="medium")
         with username_col:
             username = st.text_input("Choose username", key="register_username")
+        email_col, _email_spacer = st.columns([9, 1.5], gap="medium")
+        with email_col:
+            email = st.text_input("Email", key="register_email")
         password_col, visibility_col = st.columns([9, 1.5], gap="medium")
         with password_col:
             password = st.text_input(
                 "Choose password",
                 type="default" if st.session_state.show_register_password else "password",
                 key="register_password",
-                on_change=submit_register_from_fields,
             )
         with visibility_col:
             st.write("")
@@ -1275,19 +1973,47 @@ def render_auth_screen() -> None:
         if st.button("Register", key="register_submit", use_container_width=True):
             if len(username.strip()) < 3:
                 st.warning("Username must be at least 3 characters.")
+            elif not looks_like_email(email):
+                st.warning("Please enter a valid email.")
             elif len(password.strip()) < 4:
                 st.warning("Password must be at least 4 characters.")
             else:
-                user = register_user(username, password)
+                user = register_user(username, email, password)
                 if user:
                     authenticate(user)
 
 
 def select_conversation(conversation: dict[str, Any], *, scroll_bottom: bool = True) -> None:
+    st.session_state.active_chat_type = "single"
     st.session_state.selected_conversation_id = conversation["id"]
     st.session_state.conversation_id = conversation["conversation_id"]
     st.session_state.should_scroll_bottom = scroll_bottom
     st.query_params["conversation_id"] = conversation["conversation_id"]
+    st.query_params["chat_type"] = "single"
+    if "group_id" in st.query_params:
+        del st.query_params["group_id"]
+
+
+def select_group(group: dict[str, Any], *, scroll_bottom: bool = True) -> None:
+    st.session_state.active_chat_type = "group"
+    st.session_state.selected_group_id = group["id"]
+    st.session_state.should_scroll_bottom = scroll_bottom
+    st.session_state.group_messages = []
+    st.session_state.group_last_message_id = 0
+    st.session_state.group_messages_group_id = None
+    st.query_params["chat_type"] = "group"
+    st.query_params["group_id"] = str(group["id"])
+
+
+def select_group_id(group_id: int, *, scroll_bottom: bool = True) -> None:
+    st.session_state.active_chat_type = "group"
+    st.session_state.selected_group_id = group_id
+    st.session_state.should_scroll_bottom = scroll_bottom
+    st.session_state.group_messages = []
+    st.session_state.group_last_message_id = 0
+    st.session_state.group_messages_group_id = None
+    st.query_params["chat_type"] = "group"
+    st.query_params["group_id"] = str(group_id)
 
 
 def resolve_active_conversation(conversations: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -1337,14 +2063,115 @@ def render_conversation_list(conversations: list[dict[str, Any]]) -> dict[str, A
     return active
 
 
+def resolve_active_group(groups: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if st.session_state.active_chat_type != "group" or not groups:
+        return None
+    active_group_id = st.session_state.selected_group_id
+    active = next((group for group in groups if group["id"] == active_group_id), None)
+    if not active:
+        st.session_state.active_chat_type = "single"
+        st.session_state.selected_group_id = None
+        return None
+    return active
+
+
+def render_group_creation(user_id: int) -> None:
+    st.markdown('<p class="sidebar-title">Create group</p>', unsafe_allow_html=True)
+    with st.form("create_group_form", clear_on_submit=True):
+        group_name = st.text_input(
+            "Group name",
+            placeholder="New group name",
+            label_visibility="collapsed",
+        )
+        submitted = st.form_submit_button("Create group", use_container_width=True)
+    if submitted:
+        if not group_name.strip():
+            st.warning("Group name is required.")
+        else:
+            group = create_group(user_id, group_name)
+            if group:
+                select_group(group)
+                st.rerun()
+
+
+def render_group_list(groups: list[dict[str, Any]]) -> dict[str, Any] | None:
+    active = resolve_active_group(groups)
+    if not groups:
+        st.markdown('<div class="group-note">No group chats yet.</div>', unsafe_allow_html=True)
+        return None
+
+    with st.container(height=228, border=False):
+        for group in groups:
+            label = escape(group_label(group))
+            if active and group["id"] == active["id"]:
+                st.markdown(f'<div class="group-card-active">{label}</div>', unsafe_allow_html=True)
+                continue
+            if st.button(label, key=f"open_group_{group['id']}", use_container_width=True):
+                select_group(group)
+                st.rerun()
+    return active
+
+
+def render_invitations(user_id: int, invitations: list[dict[str, Any]] | None = None) -> None:
+    if invitations is None:
+        invitations = fetch_invitations(user_id)
+    if invitations is None or not invitations:
+        return
+
+    st.markdown('<p class="sidebar-title">Invitations</p>', unsafe_allow_html=True)
+    for invitation in invitations:
+        group_name = escape(invitation["group_name"])
+        invited_by = escape(invitation["invited_by_username"])
+        st.markdown(
+            f"""
+            <div class="invitation-card">
+                <strong>{group_name}</strong><br>
+                Invited by {invited_by}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        accept_col, decline_col = st.columns(2)
+        with accept_col:
+            if st.button("Accept", key=f"accept_invitation_{invitation['id']}", use_container_width=True):
+                accepted = accept_invitation(invitation["id"], user_id)
+                if accepted:
+                    st.session_state.active_chat_type = "group"
+                    st.session_state.selected_group_id = accepted["group_id"]
+                    st.session_state.group_messages = []
+                    st.session_state.group_last_message_id = 0
+                    st.session_state.group_messages_group_id = None
+                    st.query_params["chat_type"] = "group"
+                    st.query_params["group_id"] = str(accepted["group_id"])
+                    st.rerun()
+        with decline_col:
+            if st.button("Decline", key=f"decline_invitation_{invitation['id']}", use_container_width=True):
+                declined = decline_invitation(invitation["id"], user_id)
+                if declined:
+                    st.rerun()
+
+
+if streamlit_fragment:
+
+    @streamlit_fragment(run_every=f"{POLLING_INTERVAL_SECONDS}s")
+    def render_polled_invitations(user_id: int) -> None:
+        render_invitations(user_id)
+
+
+else:
+
+    def render_polled_invitations(user_id: int) -> None:
+        render_invitations(user_id)
+
+
 def render_search_panel(user_id: int) -> None:
     with st.form("search_form", clear_on_submit=False):
         search_input_col, search_button_col = st.columns([5, 1], gap="small")
         with search_input_col:
             query = st.text_input(
-                "Search chats or messages",
+                "Search chats, groups, emails, messages",
                 key="search_query",
-                placeholder="Search chats or messages...",
+                placeholder="Search chats, groups, emails...",
                 label_visibility="collapsed",
             )
         with search_button_col:
@@ -1370,6 +2197,10 @@ def render_search_panel(user_id: int) -> None:
         return
     conversations = results.get("conversations", []) if isinstance(results, dict) else []
     messages = results.get("messages", results if isinstance(results, list) else []) if results else []
+    groups = results.get("groups", []) if isinstance(results, dict) else []
+    group_messages = results.get("group_messages", []) if isinstance(results, dict) else []
+    group_members = results.get("group_members", []) if isinstance(results, dict) else []
+
     unique_messages = []
     seen_message_keys = set()
     for result in messages:
@@ -1383,9 +2214,73 @@ def render_search_panel(user_id: int) -> None:
         unique_messages.append(result)
     messages = unique_messages
 
-    if not conversations and not messages:
+    unique_group_messages = []
+    seen_group_message_keys = set()
+    for result in group_messages:
+        dedupe_key = (result.get("id"), result.get("group_id"), result.get("content"), result.get("created_at"))
+        if dedupe_key in seen_group_message_keys:
+            continue
+        seen_group_message_keys.add(dedupe_key)
+        unique_group_messages.append(result)
+    group_messages = unique_group_messages
+
+    if not conversations and not messages and not groups and not group_messages and not group_members:
         st.info("No matching chats or messages.")
         return
+
+    for result in groups:
+        group_name = escape(result.get("name", "Group"))
+        preview = escape(truncate_text(result.get("last_message"), 90))
+        timestamp = escape(format_timestamp(result["updated_at"]))
+        member_count = result.get("member_count", 0)
+        st.markdown(
+            f"""
+            <div class="search-result">
+                <div class="search-meta"><span class="search-kind">GROUP</span>{member_count} members · {timestamp}</div>
+                <div class="search-text"><strong>{group_name}</strong><br>{preview}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("Open group", key=f"open_search_group_{result['id']}", use_container_width=True):
+            select_group_id(result["id"])
+            st.rerun()
+
+    for result in group_members:
+        group_name = escape(result.get("group_name", "Group"))
+        username = escape(result.get("username", "User"))
+        email = escape(result.get("email") or "No email")
+        role = escape(result.get("role", "member"))
+        st.markdown(
+            f"""
+            <div class="search-result">
+                <div class="search-meta"><span class="search-kind">MEMBER</span>{group_name} · {role}</div>
+                <div class="search-text"><strong>{username}</strong><br>{email}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("Open group", key=f"open_search_group_member_{result['group_id']}_{result['user_id']}", use_container_width=True):
+            select_group_id(result["group_id"])
+            st.rerun()
+
+    for result in group_messages:
+        message_text = escape(truncate_text(result["content"], 120))
+        sender = escape(result.get("sender_display_name", "unknown"))
+        group_name = escape(result.get("group_name", "Group"))
+        timestamp = escape(format_timestamp(result["created_at"]))
+        st.markdown(
+            f"""
+            <div class="search-result">
+                <div class="search-meta"><span class="search-kind">GROUP MSG</span>{group_name} · {sender} · {timestamp}</div>
+                <div class="search-text">{message_text}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("Open group", key=f"open_search_group_message_{result['id']}", use_container_width=True):
+            select_group_id(result["group_id"])
+            st.rerun()
 
     for result in conversations:
         conversation_title = escape(result.get("title", "Conversation"))
@@ -1401,9 +2296,14 @@ def render_search_panel(user_id: int) -> None:
             unsafe_allow_html=True,
         )
         if st.button("Open", key=f"open_search_conversation_{result['id']}", use_container_width=True):
+            st.session_state.active_chat_type = "single"
+            st.session_state.selected_group_id = None
             st.session_state.selected_conversation_id = result["id"]
             st.session_state.conversation_id = result["conversation_id"]
             st.session_state.should_scroll_bottom = True
+            st.query_params["chat_type"] = "single"
+            if "group_id" in st.query_params:
+                del st.query_params["group_id"]
             st.rerun()
 
     for result in messages:
@@ -1421,87 +2321,237 @@ def render_search_panel(user_id: int) -> None:
             unsafe_allow_html=True,
         )
         if st.button("Open", key=f"open_search_result_{result['id']}", use_container_width=True):
+            st.session_state.active_chat_type = "single"
+            st.session_state.selected_group_id = None
             st.session_state.selected_conversation_id = result["conversation_id"]
             st.session_state.conversation_id = result["conversation_key"]
             st.session_state.should_scroll_bottom = True
+            st.query_params["chat_type"] = "single"
+            if "group_id" in st.query_params:
+                del st.query_params["group_id"]
             st.rerun()
+
+
+def logout_user() -> None:
+    st.session_state.user = None
+    st.session_state.is_authenticated = False
+    st.session_state.conversation_id = None
+    st.session_state.selected_conversation_id = None
+    st.session_state.active_chat_type = "single"
+    st.session_state.selected_group_id = None
+    st.session_state.group_messages = []
+    st.session_state.group_last_message_id = 0
+    st.session_state.group_messages_group_id = None
+    st.session_state.invite_panel_group_id = None
+    st.session_state.show_user_info_editor = False
+    st.session_state.show_user_menu = False
+    st.session_state.show_search = False
+    st.session_state.search_results = None
+    st.session_state.last_search_query = ""
+    st.query_params.clear()
+    st.rerun()
+
+
+def render_user_menu(user: dict[str, Any]) -> None:
+    with st.popover(user["username"], key="user_menu_popover", use_container_width=True):
+        render_user_menu_panel(user)
+
+
+def render_user_menu_panel(user: dict[str, Any]) -> None:
+    st.caption(f"User #{user['id']}")
+    if st.button("Edit user info", key="toggle_user_info_editor", use_container_width=True):
+        st.session_state.show_user_info_editor = not st.session_state.show_user_info_editor
+        st.rerun()
+
+    if st.session_state.show_user_info_editor:
+        with st.form("edit_user_info_form", clear_on_submit=False):
+            new_username = st.text_input("Username", value=user.get("username", ""))
+            new_email = st.text_input("Email", value=user.get("email") or "")
+            save_profile = st.form_submit_button("Save changes", use_container_width=True)
+        if save_profile:
+            if len(new_username.strip()) < 3:
+                st.warning("Username must be at least 3 characters.")
+            elif new_email.strip() and not looks_like_email(new_email):
+                st.warning("Please enter a valid email.")
+            else:
+                updated_user = update_user_profile(user["id"], new_username, new_email)
+                if updated_user:
+                    st.session_state.user = updated_user
+                    st.query_params["username"] = updated_user["username"]
+                    st.success("User info updated.")
+                    st.rerun()
+
+    if st.button("Logout", key="logout_from_user_menu", use_container_width=True):
+        logout_user()
+
+
+def render_single_chat_main(user: dict[str, Any], active_conversation: dict[str, Any]) -> None:
+    conversation_id = active_conversation["conversation_id"]
+    new_chat_col, _spacer_col = st.columns([1.3, 6.7])
+    with new_chat_col:
+        if st.button("New Chat", use_container_width=True):
+            conversation = create_conversation(user["id"])
+            if conversation:
+                select_conversation(conversation)
+                st.session_state.search_results = None
+                st.session_state.should_scroll_bottom = True
+                st.rerun()
+
+    render_polled_message_area(user["id"], conversation_id)
+
+    with st.form("send_message_form", clear_on_submit=True):
+        input_col, send_col = st.columns([6, 1])
+        with input_col:
+            content = st.text_input(
+                "Message",
+                placeholder="Message Chat Bro...",
+                label_visibility="collapsed",
+            )
+        with send_col:
+            submitted = st.form_submit_button("Send", use_container_width=True)
+
+    if submitted:
+        if not content.strip():
+            st.warning("Message cannot be empty.")
+        else:
+            result = send_message(user["id"], content, conversation_id)
+            if result:
+                st.session_state.should_scroll_bottom = True
+                st.rerun()
+
+
+def render_group_chat_main(user: dict[str, Any], active_group: dict[str, Any]) -> None:
+    group_name = escape(active_group["name"])
+    member_count = active_group["member_count"]
+    title_col, invite_toggle_col = st.columns([7, 0.7])
+    with title_col:
+        st.markdown(
+            f"""
+            <div class="group-controls">
+                <strong>{group_name}</strong><br>
+                {member_count} member{'s' if member_count != 1 else ''} · chatbot included
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    invite_open = st.session_state.invite_panel_group_id == active_group["id"]
+    with invite_toggle_col:
+        st.write("")
+        if st.button(
+            " ",
+            key=f"toggle_invite_group_{active_group['id']}",
+            icon=":material/add:",
+            help="Invite user",
+        ):
+            st.session_state.invite_panel_group_id = None if invite_open else active_group["id"]
+            st.rerun()
+
+    if invite_open:
+        with st.form(f"invite_group_{active_group['id']}", clear_on_submit=True):
+            invite_input_col, invite_button_col = st.columns([4, 1])
+            with invite_input_col:
+                invited_email = st.text_input(
+                    "Invite user",
+                    placeholder="Invite by email...",
+                    label_visibility="collapsed",
+                )
+            with invite_button_col:
+                invite_submitted = st.form_submit_button(
+                    "Invite",
+                    icon=":material/person_add:",
+                    use_container_width=True,
+                )
+        if invite_submitted:
+            if not invited_email.strip():
+                st.warning("Enter an email address to invite.")
+            elif not looks_like_email(invited_email):
+                st.warning("Please enter a valid email address.")
+            else:
+                invitation = invite_user_to_group(active_group["id"], user["id"], invited_email)
+                if invitation:
+                    invite_target = invitation.get("invited_email") or invitation["invited_username"]
+                    st.session_state.invite_panel_group_id = None
+                    st.success(f"Invitation sent to {invite_target}.")
+                    st.rerun()
+
+    render_polled_group_message_area(user["id"], active_group["id"])
+
+    with st.form(f"send_group_message_form_{active_group['id']}", clear_on_submit=True):
+        input_col, send_col = st.columns([6, 1])
+        with input_col:
+            content = st.text_input(
+                "Group message",
+                placeholder="Message Chat Bro...",
+                label_visibility="collapsed",
+            )
+        with send_col:
+            submitted = st.form_submit_button("Send", use_container_width=True)
+
+    render_group_typing_capture(user["id"], active_group["id"])
+
+    if submitted:
+        if not content.strip():
+            st.warning("Message cannot be empty.")
+        else:
+            result = send_group_message(user["id"], active_group["id"], content)
+            if result:
+                append_group_messages(result.get("messages", []))
+                st.session_state.should_scroll_bottom = True
+                st.rerun()
 
 
 def render_chat_screen() -> None:
     user = st.session_state.user
-    username = escape(user["username"])
     conversations = fetch_conversations(user["id"])
     if conversations is None:
         st.stop()
-
-    st.markdown(
-        f"""
-        <div class="topbar">
-            <div class="brand">Chat<span> Bro</span></div>
-            <div class="topbar-message" dir="rtl">Chat Bro מחובר. שאל שאלה, בדוק את הזרימה, והתחל שיחה.</div>
-            <div class="user-pill">Logged in as {username}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    sidebar_col, chat_col = st.columns([1.25, 3.75], gap="large")
-    with sidebar_col:
-        active_conversation = render_conversation_list(conversations)
-        render_search_panel(user["id"])
-
-    if not active_conversation:
+    groups = fetch_groups(user["id"])
+    if groups is None:
         st.stop()
 
-    conversation_id = active_conversation["conversation_id"]
+    brand_col, message_col, user_menu_col = st.columns([1.4, 4.4, 1.3], gap="small")
+    with brand_col:
+        st.markdown(
+            '<div class="topbar-brand-block"><div class="brand">Chat<span> Bro</span></div></div>',
+            unsafe_allow_html=True,
+        )
+    with message_col:
+        st.markdown(
+            '<div class="topbar-message topbar-message-block" dir="rtl">Chat Bro מחובר. שאל שאלה, בדוק את הזרימה, והתחל שיחה.</div>',
+            unsafe_allow_html=True,
+        )
+    with user_menu_col:
+        render_user_menu(user)
+
+    sidebar_col, chat_col = st.columns([1.25, 3.75], gap="large")
+    active_conversation = None
+    active_group = None
+    with sidebar_col:
+        render_search_panel(user["id"])
+        render_polled_invitations(user["id"])
+        with st.expander("MyChat", expanded=True):
+            active_conversation = render_conversation_list(conversations)
+        with st.expander("MyGroups", expanded=st.session_state.active_chat_type == "group"):
+            render_group_creation(user["id"])
+            active_group = render_group_list(groups)
+
+    if st.session_state.active_chat_type == "group" and not active_group:
+        st.session_state.active_chat_type = "single"
+
+    if st.session_state.active_chat_type == "single" and not active_conversation:
+        st.stop()
+
     with chat_col:
-        new_chat_col, spacer_col, logout_col = st.columns([1.3, 5.7, 1])
-        with new_chat_col:
-            if st.button("New Chat", use_container_width=True):
-                conversation = create_conversation(user["id"])
-                if conversation:
-                    select_conversation(conversation)
-                    st.session_state.search_results = None
-                    st.session_state.should_scroll_bottom = True
-                    st.rerun()
-        with logout_col:
-            if st.button("Logout", use_container_width=True):
-                st.session_state.user = None
-                st.session_state.is_authenticated = False
-                st.session_state.conversation_id = None
-                st.session_state.selected_conversation_id = None
-                st.session_state.show_search = False
-                st.session_state.search_results = None
-                st.session_state.last_search_query = ""
-                st.query_params.clear()
-                st.rerun()
-
-        render_polled_message_area(user["id"], conversation_id)
-
-        with st.form("send_message_form", clear_on_submit=True):
-            input_col, send_col = st.columns([6, 1])
-            with input_col:
-                content = st.text_input(
-                    "Message",
-                    placeholder="Message Chat Bro...",
-                    label_visibility="collapsed",
-                )
-            with send_col:
-                submitted = st.form_submit_button("Send", use_container_width=True)
-
-        if submitted:
-            if not content.strip():
-                st.warning("Message cannot be empty.")
-            else:
-                result = send_message(user["id"], content, conversation_id)
-                if result:
-                    st.session_state.should_scroll_bottom = True
-                    st.rerun()
+        if st.session_state.active_chat_type == "group" and active_group:
+            render_group_chat_main(user, active_group)
+        elif active_conversation:
+            render_single_chat_main(user, active_conversation)
 
 
 def main() -> None:
     init_session_state()
     inject_css()
+    install_message_autoscroll()
 
     if st.session_state.is_authenticated and st.session_state.user:
         render_chat_screen()

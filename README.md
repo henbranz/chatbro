@@ -10,7 +10,7 @@ User -> Streamlit frontend -> FastAPI backend -> SQLite database
 
 ה-frontend אינו ניגש למסד הנתונים ישירות. כל הפעולות עוברות דרך HTTP JSON אל ה-backend, ורק FastAPI קורא וכותב ל-SQLite.
 
-המערכת כוללת הרשמה/התחברות, רשימת שיחות, בחירת שיחה, שליחת הודעות, רענון הודעות באמצעות polling, וחיפוש חופשי בתוכן ההודעות.
+המערכת כוללת הרשמה/התחברות, רשימת שיחות, בחירת שיחה, שליחת הודעות, רענון הודעות באמצעות polling, חיפוש חופשי בתוכן ההודעות, וצ'אטים קבוצתיים עם Chat Bro.
 
 ## מבנה תיקיות
 
@@ -57,7 +57,7 @@ py -m venv .venv
 Mac/Linux:
 
 ```bash
-python run_local.py
+python3 run_local.py
 ```
 
 Windows PowerShell:
@@ -73,12 +73,14 @@ Backend:  http://127.0.0.1:8000
 Frontend: http://127.0.0.1:8501
 ```
 
-אם הפורטים תפוסים:
+אם אחד הפורטים תפוס, `run_local.py` יבחר אוטומטית את הפורט הפנוי הבא וידפיס את הכתובת הנכונה לפתיחה בדפדפן.
+
+אפשר גם לבחור פורטים ידנית:
 
 Mac/Linux:
 
 ```bash
-CHAT_BRO_BACKEND_PORT=8005 CHAT_BRO_FRONTEND_PORT=8505 python run_local.py
+CHAT_BRO_BACKEND_PORT=8005 CHAT_BRO_FRONTEND_PORT=8505 python3 run_local.py
 ```
 
 Windows PowerShell:
@@ -152,6 +154,31 @@ $env:CHAT_BRO_API_BASE_URL="http://127.0.0.1:8003"
 9. רעננו את הדף וודאו שהשיחות וההודעות נשארות.
 10. התחברו עם משתמש אחר וודאו שהוא לא רואה את ההודעות של המשתמש הראשון.
 
+## בדיקת צ'אט קבוצתי
+
+1. צרו שני משתמשים שונים, למשל `parent1` ו-`parent2`, עם כתובות אימייל שונות.
+2. התחברו כ-`parent1`.
+3. באזור `MyGroups`, צרו קבוצה חדשה עם שם ברור.
+4. ודאו שהקבוצה מופיעה ברשימת הקבוצות וש-`parent1` יכול לשלוח הודעה.
+5. הזמינו את `parent2` דרך שדה ההזמנה בתוך הקבוצה באמצעות כתובת האימייל שאיתה הוא נרשם.
+6. התחברו כ-`parent2` במחשב או דפדפן אחר.
+7. ודאו שההזמנה מופיעה באזור `Invitations` בתוך `MyGroups`.
+8. לחצו `Accept` וודאו שהקבוצה מופיעה לרשימת הקבוצות של `parent2`.
+9. שלחו הודעה כ-`parent2` וודאו שההודעה מופיעה גם אצל `parent1`.
+10. ודאו שהבוט עונה בתוך אותה קבוצה.
+11. שלחו הודעה נוספת והמתינו ל-polling; ודאו שאין שכפול הודעות.
+12. נסו לפתוח הודעות קבוצה עם משתמש שאינו חבר דרך ה-API; ה-backend אמור להחזיר 403.
+
+## בדיקות אוטומטיות
+
+יש בדיקת backend בסיסית לצ'אטים קבוצתיים:
+
+```bash
+python -m unittest tests.test_group_api
+```
+
+הבדיקה משתמשת במסד SQLite זמני, ולכן היא לא נוגעת ב-`messages.db` המקומי.
+
 ## מסד נתונים
 
 SQLite נשמר מקומית בקובץ:
@@ -168,9 +195,36 @@ DATABASE_URL=sqlite:///./messages.db
 
 המערכת כוללת טבלאות `users`, `conversations`, `conversation_participants`, ו-`messages`.
 
+לצ'אטים קבוצתיים נוספו טבלאות נפרדות כדי לא לשבור את זרימת הצ'אט הרגילה:
+
+```text
+group_chats
+group_members
+group_invitations
+group_messages
+```
+
 לפי דרישת ה-PRD לפרויקט הדמו, משתמשים חדשים נשמרים גם עם סיסמה גלויה בשדה `password`. זה מתאים לפרויקט לימודי בלבד ולא מתאים לפרודקשן.
 
+טבלת `users` כוללת גם שדה `email` ייחודי למשתמשים חדשים, כדי שאפשר יהיה להזמין משתמשים לקבוצות לפי כתובת אימייל רשומה.
+
 הודעות חדשות נשמרות עם `user_id`, `role`, `message_content`, ו-`conversation_id`, כדי לתמוך בצ'אטים נפרדים לכל משתמש. טבלת `conversations` מוסיפה מזהה מספרי לשיחות עבור ה-API החדש, תוך שמירה על תאימות לשיחות קיימות.
+
+## API לצ'אטים קבוצתיים
+
+```text
+POST /groups/create
+GET  /groups/my
+POST /groups/{group_id}/invite
+GET  /invitations/my
+POST /invitations/{invitation_id}/accept
+POST /invitations/{invitation_id}/decline
+GET  /groups/{group_id}/messages
+GET  /groups/{group_id}/messages/new?after_id=...
+POST /groups/{group_id}/messages
+```
+
+כל קריאה שמחזירה או שומרת הודעות קבוצה מאמתת שהמשתמש חבר בקבוצה. הזמנות אפשר לקבל או לדחות רק על ידי המשתמש שהוזמן.
 
 ## Deployment ל-Render
 

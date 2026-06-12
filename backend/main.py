@@ -1,6 +1,7 @@
 import os
 import time
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 import requests
@@ -11,7 +12,20 @@ from pydantic import BaseModel
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
-from .database import Conversation, ConversationParticipant, Message, SessionLocal, User, get_db, init_db
+from .database import (
+    Conversation,
+    ConversationParticipant,
+    GroupChat,
+    GroupInvitation,
+    GroupMember,
+    GroupMessage,
+    GroupTypingStatus,
+    Message,
+    SessionLocal,
+    User,
+    get_db,
+    init_db,
+)
 
 
 app = FastAPI(title="Chat Bro API")
@@ -19,6 +33,7 @@ BOT_USERNAME = "chatbro"
 LEGACY_BOT_USERNAME = "simplebot"
 BOT_USERNAMES = {BOT_USERNAME, LEGACY_BOT_USERNAME}
 BOT_PASSWORD_HASH = "bot-account-cannot-login"
+PRODUCT_BOT_DISPLAY_NAME = "Chat Bro"
 
 
 def load_local_env_value(name: str) -> str:
@@ -58,11 +73,18 @@ password_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 class AuthRequest(BaseModel):
     username: str
     password: str
+    email: str | None = None
+
+
+class UserUpdateRequest(BaseModel):
+    username: str | None = None
+    email: str | None = None
 
 
 class UserResponse(BaseModel):
     id: int
     username: str
+    email: str | None = None
     success: bool = True
     message: str | None = None
     user_id: int | None = None
@@ -82,6 +104,32 @@ class ConversationMessageCreateRequest(BaseModel):
 class ConversationCreateRequest(BaseModel):
     user_id: int
     title: str | None = None
+
+
+class GroupCreateRequest(BaseModel):
+    user_id: int
+    name: str
+
+
+class GroupInviteRequest(BaseModel):
+    inviter_user_id: int
+    invited_email: str | None = None
+    invited_username: str | None = None
+    invited_user_id: int | None = None
+
+
+class InvitationActionRequest(BaseModel):
+    user_id: int
+
+
+class GroupMessageCreateRequest(BaseModel):
+    sender_id: int
+    content: str
+
+
+class GroupTypingRequest(BaseModel):
+    user_id: int
+    is_typing: bool = True
 
 
 class MessageResponse(BaseModel):
@@ -116,6 +164,54 @@ class ConversationMessageResponse(BaseModel):
     created_at: datetime
 
 
+class GroupResponse(BaseModel):
+    id: int
+    name: str
+    created_by_user_id: int
+    created_by_username: str
+    role: str
+    member_count: int
+    last_message: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class GroupInvitationResponse(BaseModel):
+    id: int
+    group_id: int
+    group_name: str
+    invited_user_id: int
+    invited_username: str
+    invited_email: str | None = None
+    invited_by_user_id: int
+    invited_by_username: str
+    status: str
+    created_at: datetime
+    responded_at: datetime | None = None
+
+
+class GroupMessageResponse(BaseModel):
+    id: int
+    group_id: int
+    sender_type: str
+    sender_user_id: int | None = None
+    sender_display_name: str
+    role: str
+    content: str
+    created_at: datetime
+
+
+class GroupMessageCreateResponse(BaseModel):
+    messages: list[GroupMessageResponse]
+    bot_pending: bool = True
+
+
+class GroupTypingResponse(BaseModel):
+    user_id: int
+    username: str
+    updated_at: datetime
+
+
 class SearchMessageResponse(BaseModel):
     id: int
     conversation_id: int
@@ -129,9 +225,34 @@ class SearchMessageResponse(BaseModel):
     created_at: datetime
 
 
+class SearchGroupMessageResponse(BaseModel):
+    id: int
+    group_id: int
+    group_name: str
+    sender_type: str
+    sender_user_id: int | None = None
+    sender_display_name: str
+    role: str
+    content: str
+    created_at: datetime
+
+
+class SearchGroupMemberResponse(BaseModel):
+    group_id: int
+    group_name: str
+    user_id: int
+    username: str
+    email: str | None = None
+    role: str
+    joined_at: datetime
+
+
 class SearchResponse(BaseModel):
     conversations: list[ConversationResponse]
     messages: list[SearchMessageResponse]
+    groups: list[GroupResponse] = []
+    group_messages: list[SearchGroupMessageResponse] = []
+    group_members: list[SearchGroupMemberResponse] = []
 
 
 class GeminiSettingsRequest(BaseModel):
@@ -161,6 +282,10 @@ def on_startup() -> None:
 
 def normalize_username(username: str) -> str:
     return username.strip().lower()
+
+
+def normalize_email(email: str | None) -> str:
+    return (email or "").strip().lower()
 
 
 def hash_password(password: str) -> str:
@@ -225,6 +350,164 @@ def refresh_conversation_title(db: Session, conversation: Conversation, user_id:
     if not is_auto_conversation_title(conversation):
         return
     conversation.title = title_from_message(content) if content else first_user_message_title(db, conversation, user_id) or conversation.title
+
+
+@dataclass
+class BotHistoryMessage:
+    role: str
+    content: str
+    message_content: str
+
+
+def get_regular_user(db: Session, user_id: int, *, detail: str = "User not found.") -> User:
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user or user.username in BOT_USERNAMES:
+        raise HTTPException(status_code=404, detail=detail)
+    return user
+
+
+def find_regular_user_by_username(db: Session, username: str) -> User:
+    normalized = normalize_username(username)
+    user = db.query(User).filter(User.username == normalized).first()
+    if not user or user.username in BOT_USERNAMES:
+        raise HTTPException(status_code=404, detail="Invited user not found.")
+    return user
+
+
+def find_regular_user_by_email(db: Session, email: str) -> User:
+    normalized = normalize_email(email)
+    user = db.query(User).filter(User.email == normalized).first()
+    if not user or user.username in BOT_USERNAMES:
+        raise HTTPException(status_code=404, detail="Invited email not found.")
+    return user
+
+
+def is_valid_email(email: str) -> bool:
+    local, separator, domain = email.partition("@")
+    return bool(local and separator and "." in domain and not domain.startswith(".") and not domain.endswith("."))
+
+
+def get_group(db: Session, group_id: int) -> GroupChat:
+    group = db.query(GroupChat).filter(GroupChat.id == group_id).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Group chat not found.")
+    return group
+
+
+def get_group_membership(db: Session, group_id: int, user_id: int) -> GroupMember | None:
+    return (
+        db.query(GroupMember)
+        .filter(GroupMember.group_id == group_id, GroupMember.user_id == user_id)
+        .first()
+    )
+
+
+def require_group_member(db: Session, group_id: int, user_id: int) -> GroupMember:
+    membership = get_group_membership(db, group_id, user_id)
+    if not membership:
+        raise HTTPException(status_code=403, detail="User is not a member of this group.")
+    return membership
+
+
+def group_message_to_response(message: GroupMessage) -> GroupMessageResponse:
+    return GroupMessageResponse(
+        id=message.id,
+        group_id=message.group_id,
+        sender_type=message.sender_type,
+        sender_user_id=message.sender_user_id,
+        sender_display_name=message.sender_display_name,
+        role=message.role,
+        content=message.content,
+        created_at=message.created_at,
+    )
+
+
+def group_to_response(db: Session, group: GroupChat, user_id: int) -> GroupResponse:
+    membership = get_group_membership(db, group.id, user_id)
+    if not membership:
+        raise HTTPException(status_code=403, detail="User is not a member of this group.")
+
+    member_count = db.query(GroupMember).filter(GroupMember.group_id == group.id).count()
+    last_message = (
+        db.query(GroupMessage)
+        .filter(GroupMessage.group_id == group.id)
+        .order_by(GroupMessage.created_at.desc(), GroupMessage.id.desc())
+        .first()
+    )
+    return GroupResponse(
+        id=group.id,
+        name=group.name,
+        created_by_user_id=group.created_by_user_id,
+        created_by_username=group.creator.username,
+        role=membership.role,
+        member_count=member_count,
+        last_message=last_message.content if last_message else None,
+        created_at=group.created_at,
+        updated_at=last_message.created_at if last_message else group.updated_at,
+    )
+
+
+def invitation_to_response(invitation: GroupInvitation) -> GroupInvitationResponse:
+    return GroupInvitationResponse(
+        id=invitation.id,
+        group_id=invitation.group_id,
+        group_name=invitation.group.name,
+        invited_user_id=invitation.invited_user_id,
+        invited_username=invitation.invited_user.username,
+        invited_email=invitation.invited_user.email,
+        invited_by_user_id=invitation.invited_by_user_id,
+        invited_by_username=invitation.invited_by_user.username,
+        status=invitation.status,
+        created_at=invitation.created_at,
+        responded_at=invitation.responded_at,
+    )
+
+
+def touch_group(group: GroupChat) -> None:
+    group.updated_at = datetime.utcnow()
+
+
+def save_group_message(
+    db: Session,
+    group: GroupChat,
+    content: str,
+    *,
+    sender_type: str,
+    role: str,
+    sender_display_name: str,
+    sender_user_id: int | None = None,
+) -> GroupMessage:
+    touch_group(group)
+    message = GroupMessage(
+        group_id=group.id,
+        sender_type=sender_type,
+        sender_user_id=sender_user_id,
+        sender_display_name=sender_display_name,
+        role=role,
+        content=content,
+    )
+    db.add(message)
+    db.commit()
+    db.refresh(message)
+    return message
+
+
+def get_recent_group_history(db: Session, group_id: int, limit: int = 12) -> list[BotHistoryMessage]:
+    messages = (
+        db.query(GroupMessage)
+        .filter(GroupMessage.group_id == group_id, GroupMessage.sender_type.in_(["user", "bot"]))
+        .order_by(GroupMessage.created_at.desc(), GroupMessage.id.desc())
+        .limit(limit)
+        .all()
+    )[::-1]
+    return [
+        BotHistoryMessage(
+            role="assistant" if message.sender_type == "bot" else "user",
+            content=message.content,
+            message_content=message.content,
+        )
+        for message in messages
+    ]
 
 
 def get_or_create_bot_user(db: Session) -> User:
@@ -562,6 +845,31 @@ def create_background_bot_reply(
         db.close()
 
 
+def create_background_group_bot_reply(
+    group_id: int,
+    user_id: int,
+    username: str,
+    content: str,
+) -> None:
+    time.sleep(0.8)
+    db = SessionLocal()
+    try:
+        get_or_create_bot_user(db)
+        group = get_group(db, group_id)
+        history = get_recent_group_history(db, group_id)
+        reply = generate_bot_reply(user_id, username, content, history)
+        save_group_message(
+            db,
+            group,
+            reply,
+            sender_type="bot",
+            role="assistant",
+            sender_display_name=PRODUCT_BOT_DISPLAY_NAME,
+        )
+    finally:
+        db.close()
+
+
 @app.get("/")
 def health() -> dict[str, str | bool]:
     _api_key, model, _source = get_gemini_settings()
@@ -589,6 +897,302 @@ def get_gemini_status(
         source=source,
         last_error=USER_GEMINI_ERRORS.get(user_id),
     )
+
+
+@app.post("/groups/create", response_model=GroupResponse, status_code=status.HTTP_201_CREATED)
+def create_group_chat(
+    payload: GroupCreateRequest,
+    db: Session = Depends(get_db),
+) -> GroupResponse:
+    creator = get_regular_user(db, payload.user_id, detail="Creator not found.")
+    name = " ".join(payload.name.split())
+    if not name:
+        raise HTTPException(status_code=400, detail="Group name is required.")
+
+    group = GroupChat(name=name[:200], created_by_user_id=creator.id)
+    db.add(group)
+    db.flush()
+    db.add(GroupMember(group_id=group.id, user_id=creator.id, role="owner"))
+    db.flush()
+    save_group_message(
+        db,
+        group,
+        f"{creator.username} created the group.",
+        sender_type="system",
+        role="system",
+        sender_display_name="System",
+    )
+    return group_to_response(db, group, creator.id)
+
+
+@app.get("/groups/my", response_model=list[GroupResponse])
+def get_my_groups(
+    user_id: int = Query(..., ge=1),
+    db: Session = Depends(get_db),
+) -> list[GroupResponse]:
+    user = get_regular_user(db, user_id)
+    groups = (
+        db.query(GroupChat)
+        .join(GroupMember, GroupMember.group_id == GroupChat.id)
+        .filter(GroupMember.user_id == user.id)
+        .order_by(GroupChat.updated_at.desc(), GroupChat.id.desc())
+        .all()
+    )
+    return [group_to_response(db, group, user.id) for group in groups]
+
+
+@app.post("/groups/{group_id}/invite", response_model=GroupInvitationResponse, status_code=status.HTTP_201_CREATED)
+def invite_user_to_group(
+    group_id: int,
+    payload: GroupInviteRequest,
+    db: Session = Depends(get_db),
+) -> GroupInvitationResponse:
+    inviter = get_regular_user(db, payload.inviter_user_id, detail="Inviting user not found.")
+    group = get_group(db, group_id)
+    require_group_member(db, group.id, inviter.id)
+
+    if payload.invited_email:
+        invited_user = find_regular_user_by_email(db, payload.invited_email)
+    elif payload.invited_user_id is not None:
+        invited_user = get_regular_user(db, payload.invited_user_id, detail="Invited user not found.")
+    elif payload.invited_username:
+        invited_user = find_regular_user_by_username(db, payload.invited_username)
+    else:
+        raise HTTPException(status_code=400, detail="Invite requires an email, username, or user id.")
+
+    if invited_user.id == inviter.id:
+        raise HTTPException(status_code=400, detail="You are already a member of this group.")
+    if get_group_membership(db, group.id, invited_user.id):
+        raise HTTPException(status_code=400, detail="User is already a member of this group.")
+
+    pending_invitation = (
+        db.query(GroupInvitation)
+        .filter(
+            GroupInvitation.group_id == group.id,
+            GroupInvitation.invited_user_id == invited_user.id,
+            GroupInvitation.status == "pending",
+        )
+        .first()
+    )
+    if pending_invitation:
+        raise HTTPException(status_code=409, detail="This user already has a pending invitation.")
+
+    invitation = GroupInvitation(
+        group_id=group.id,
+        invited_user_id=invited_user.id,
+        invited_by_user_id=inviter.id,
+        status="pending",
+    )
+    db.add(invitation)
+    db.flush()
+    save_group_message(
+        db,
+        group,
+        f"{inviter.username} invited {invited_user.email or invited_user.username}.",
+        sender_type="system",
+        role="system",
+        sender_display_name="System",
+    )
+    return invitation_to_response(invitation)
+
+
+@app.get("/invitations/my", response_model=list[GroupInvitationResponse])
+def get_my_invitations(
+    user_id: int = Query(..., ge=1),
+    db: Session = Depends(get_db),
+) -> list[GroupInvitationResponse]:
+    user = get_regular_user(db, user_id)
+    invitations = (
+        db.query(GroupInvitation)
+        .filter(GroupInvitation.invited_user_id == user.id, GroupInvitation.status == "pending")
+        .order_by(GroupInvitation.created_at.desc(), GroupInvitation.id.desc())
+        .all()
+    )
+    return [invitation_to_response(invitation) for invitation in invitations]
+
+
+@app.post("/invitations/{invitation_id}/accept", response_model=GroupInvitationResponse)
+def accept_group_invitation(
+    invitation_id: int,
+    payload: InvitationActionRequest,
+    db: Session = Depends(get_db),
+) -> GroupInvitationResponse:
+    user = get_regular_user(db, payload.user_id)
+    invitation = db.query(GroupInvitation).filter(GroupInvitation.id == invitation_id).first()
+    if not invitation:
+        raise HTTPException(status_code=404, detail="Invitation not found.")
+    if invitation.invited_user_id != user.id:
+        raise HTTPException(status_code=403, detail="You can only accept your own invitations.")
+    if invitation.status != "pending":
+        raise HTTPException(status_code=400, detail=f"Invitation is already {invitation.status}.")
+
+    if not get_group_membership(db, invitation.group_id, user.id):
+        db.add(GroupMember(group_id=invitation.group_id, user_id=user.id, role="member"))
+        db.flush()
+
+    invitation.status = "accepted"
+    invitation.responded_at = datetime.utcnow()
+    save_group_message(
+        db,
+        invitation.group,
+        f"{user.username} joined the group.",
+        sender_type="system",
+        role="system",
+        sender_display_name="System",
+    )
+    return invitation_to_response(invitation)
+
+
+@app.post("/invitations/{invitation_id}/decline", response_model=GroupInvitationResponse)
+def decline_group_invitation(
+    invitation_id: int,
+    payload: InvitationActionRequest,
+    db: Session = Depends(get_db),
+) -> GroupInvitationResponse:
+    user = get_regular_user(db, payload.user_id)
+    invitation = db.query(GroupInvitation).filter(GroupInvitation.id == invitation_id).first()
+    if not invitation:
+        raise HTTPException(status_code=404, detail="Invitation not found.")
+    if invitation.invited_user_id != user.id:
+        raise HTTPException(status_code=403, detail="You can only decline your own invitations.")
+    if invitation.status != "pending":
+        raise HTTPException(status_code=400, detail=f"Invitation is already {invitation.status}.")
+
+    invitation.status = "declined"
+    invitation.responded_at = datetime.utcnow()
+    save_group_message(
+        db,
+        invitation.group,
+        f"{user.username} declined the invitation.",
+        sender_type="system",
+        role="system",
+        sender_display_name="System",
+    )
+    return invitation_to_response(invitation)
+
+
+@app.get("/groups/{group_id}/messages", response_model=list[GroupMessageResponse])
+def get_group_messages(
+    group_id: int,
+    user_id: int = Query(..., ge=1),
+    after_id: int | None = Query(default=None, ge=0),
+    limit: int = Query(default=100, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> list[GroupMessageResponse]:
+    user = get_regular_user(db, user_id)
+    group = get_group(db, group_id)
+    require_group_member(db, group.id, user.id)
+
+    query = db.query(GroupMessage).filter(GroupMessage.group_id == group.id)
+    if after_id is not None:
+        query = query.filter(GroupMessage.id > after_id)
+    messages = query.order_by(GroupMessage.id.asc()).limit(limit).all()
+    return [group_message_to_response(message) for message in messages]
+
+
+@app.get("/groups/{group_id}/messages/new", response_model=list[GroupMessageResponse])
+def get_new_group_messages(
+    group_id: int,
+    user_id: int = Query(..., ge=1),
+    after_id: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> list[GroupMessageResponse]:
+    return get_group_messages(group_id, user_id=user_id, after_id=after_id, limit=limit, db=db)
+
+
+@app.get("/groups/{group_id}/typing", response_model=list[GroupTypingResponse])
+def get_group_typing_statuses(
+    group_id: int,
+    user_id: int = Query(..., ge=1),
+    db: Session = Depends(get_db),
+) -> list[GroupTypingResponse]:
+    user = get_regular_user(db, user_id)
+    group = get_group(db, group_id)
+    require_group_member(db, group.id, user.id)
+
+    cutoff = datetime.utcnow() - timedelta(seconds=6)
+    db.query(GroupTypingStatus).filter(GroupTypingStatus.updated_at < cutoff).delete(synchronize_session=False)
+    statuses = (
+        db.query(GroupTypingStatus)
+        .join(User, User.id == GroupTypingStatus.user_id)
+        .filter(
+            GroupTypingStatus.group_id == group.id,
+            GroupTypingStatus.user_id != user.id,
+            GroupTypingStatus.updated_at >= cutoff,
+        )
+        .order_by(GroupTypingStatus.updated_at.desc(), GroupTypingStatus.id.desc())
+        .all()
+    )
+    db.commit()
+    return [
+        GroupTypingResponse(user_id=status.user_id, username=status.user.username, updated_at=status.updated_at)
+        for status in statuses
+    ]
+
+
+@app.post("/groups/{group_id}/typing", response_model=dict[str, bool])
+def update_group_typing_status(
+    group_id: int,
+    payload: GroupTypingRequest,
+    db: Session = Depends(get_db),
+) -> dict[str, bool]:
+    user = get_regular_user(db, payload.user_id)
+    group = get_group(db, group_id)
+    require_group_member(db, group.id, user.id)
+
+    status_row = (
+        db.query(GroupTypingStatus)
+        .filter(GroupTypingStatus.group_id == group.id, GroupTypingStatus.user_id == user.id)
+        .first()
+    )
+    if payload.is_typing:
+        if status_row:
+            status_row.updated_at = datetime.utcnow()
+        else:
+            db.add(GroupTypingStatus(group_id=group.id, user_id=user.id))
+    elif status_row:
+        db.delete(status_row)
+
+    db.commit()
+    return {"success": True}
+
+
+@app.post(
+    "/groups/{group_id}/messages",
+    response_model=GroupMessageCreateResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_group_message(
+    group_id: int,
+    payload: GroupMessageCreateRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+) -> GroupMessageCreateResponse:
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Message content cannot be empty.")
+
+    sender = get_regular_user(db, payload.sender_id, detail="Sender not found.")
+    group = get_group(db, group_id)
+    require_group_member(db, group.id, sender.id)
+
+    user_message = save_group_message(
+        db,
+        group,
+        content,
+        sender_type="user",
+        sender_user_id=sender.id,
+        sender_display_name=sender.username,
+        role="user",
+    )
+    db.query(GroupTypingStatus).filter(
+        GroupTypingStatus.group_id == group.id,
+        GroupTypingStatus.user_id == sender.id,
+    ).delete(synchronize_session=False)
+    db.commit()
+    background_tasks.add_task(create_background_group_bot_reply, group.id, sender.id, sender.username, content)
+    return GroupMessageCreateResponse(messages=[group_message_to_response(user_message)], bot_pending=True)
 
 
 @app.get("/conversations", response_model=list[ConversationResponse])
@@ -799,6 +1403,48 @@ def search(
         .all()
     )
 
+    accessible_group_ids = [
+        row[0]
+        for row in db.query(GroupMember.group_id)
+        .filter(GroupMember.user_id == user.id)
+        .all()
+    ]
+    groups: list[GroupChat] = []
+    group_messages: list[GroupMessage] = []
+    group_members: list[GroupMember] = []
+    if accessible_group_ids:
+        groups = (
+            db.query(GroupChat)
+            .filter(GroupChat.id.in_(accessible_group_ids), GroupChat.name.ilike(like_term))
+            .order_by(GroupChat.updated_at.desc(), GroupChat.id.desc())
+            .limit(20)
+            .all()
+        )
+        group_messages = (
+            db.query(GroupMessage)
+            .filter(
+                GroupMessage.group_id.in_(accessible_group_ids),
+                or_(
+                    GroupMessage.content.ilike(like_term),
+                    GroupMessage.sender_display_name.ilike(like_term),
+                ),
+            )
+            .order_by(GroupMessage.created_at.desc(), GroupMessage.id.desc())
+            .limit(limit)
+            .all()
+        )
+        group_members = (
+            db.query(GroupMember)
+            .join(User, User.id == GroupMember.user_id)
+            .filter(
+                GroupMember.group_id.in_(accessible_group_ids),
+                or_(User.email.ilike(like_term), User.username.ilike(like_term)),
+            )
+            .order_by(GroupMember.joined_at.desc(), GroupMember.id.desc())
+            .limit(20)
+            .all()
+        )
+
     conversations_by_key = {
         conversation.conversation_key: conversation
         for conversation in (
@@ -836,6 +1482,33 @@ def search(
     return SearchResponse(
         conversations=[conversation_to_response(db, conversation, user.id) for conversation in conversations],
         messages=message_results,
+        groups=[group_to_response(db, group, user.id) for group in groups],
+        group_messages=[
+            SearchGroupMessageResponse(
+                id=message.id,
+                group_id=message.group_id,
+                group_name=message.group.name,
+                sender_type=message.sender_type,
+                sender_user_id=message.sender_user_id,
+                sender_display_name=message.sender_display_name,
+                role=message.role,
+                content=message.content,
+                created_at=message.created_at,
+            )
+            for message in group_messages
+        ],
+        group_members=[
+            SearchGroupMemberResponse(
+                group_id=membership.group_id,
+                group_name=membership.group.name,
+                user_id=membership.user_id,
+                username=membership.user.username,
+                email=membership.user.email,
+                role=membership.role,
+                joined_at=membership.joined_at,
+            )
+            for membership in group_members
+        ],
     )
 
 
@@ -857,10 +1530,13 @@ def save_gemini_settings(
 @app.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 def register(payload: AuthRequest, db: Session = Depends(get_db)) -> UserResponse:
     username = normalize_username(payload.username)
+    email = normalize_email(payload.email)
     password = payload.password
 
     if not username:
         raise HTTPException(status_code=400, detail="Username is required.")
+    if not email or not is_valid_email(email):
+        raise HTTPException(status_code=400, detail="A valid email is required.")
     if not password:
         raise HTTPException(status_code=400, detail="Password is required.")
     if username in BOT_USERNAMES:
@@ -870,7 +1546,11 @@ def register(payload: AuthRequest, db: Session = Depends(get_db)) -> UserRespons
     if existing_user:
         raise HTTPException(status_code=400, detail="Username already exists.")
 
-    user = User(username=username, password=password, password_hash=password)
+    existing_email = db.query(User).filter(User.email == email).first()
+    if existing_email:
+        raise HTTPException(status_code=400, detail="Email already exists.")
+
+    user = User(username=username, email=email, password=password, password_hash=password)
     db.add(user)
     db.commit()
     db.refresh(user)
@@ -879,6 +1559,7 @@ def register(payload: AuthRequest, db: Session = Depends(get_db)) -> UserRespons
     return UserResponse(
         id=user.id,
         username=user.username,
+        email=user.email,
         user_id=user.id,
         message="User registered successfully",
     )
@@ -897,8 +1578,60 @@ def login(payload: AuthRequest, db: Session = Depends(get_db)) -> UserResponse:
     return UserResponse(
         id=user.id,
         username=user.username,
+        email=user.email,
         user_id=user.id,
         message="Login successful",
+    )
+
+
+@app.get("/users/{user_id}", response_model=UserResponse)
+def get_user_profile(user_id: int, db: Session = Depends(get_db)) -> UserResponse:
+    user = get_regular_user(db, user_id)
+    return UserResponse(
+        id=user.id,
+        username=user.username,
+        email=user.email,
+        user_id=user.id,
+        message="User profile loaded",
+    )
+
+
+@app.patch("/users/{user_id}", response_model=UserResponse)
+def update_user_profile(
+    user_id: int,
+    payload: UserUpdateRequest,
+    db: Session = Depends(get_db),
+) -> UserResponse:
+    user = get_regular_user(db, user_id)
+
+    if payload.username is not None:
+        username = normalize_username(payload.username)
+        if len(username) < 3:
+            raise HTTPException(status_code=400, detail="Username must be at least 3 characters.")
+        if username in BOT_USERNAMES:
+            raise HTTPException(status_code=400, detail="This username is reserved.")
+        existing_username = db.query(User).filter(User.username == username, User.id != user.id).first()
+        if existing_username:
+            raise HTTPException(status_code=400, detail="Username already exists.")
+        user.username = username
+
+    if payload.email is not None:
+        email = normalize_email(payload.email)
+        if email and not is_valid_email(email):
+            raise HTTPException(status_code=400, detail="A valid email is required.")
+        existing_email = db.query(User).filter(User.email == email, User.id != user.id).first() if email else None
+        if existing_email:
+            raise HTTPException(status_code=400, detail="Email already exists.")
+        user.email = email or None
+
+    db.commit()
+    db.refresh(user)
+    return UserResponse(
+        id=user.id,
+        username=user.username,
+        email=user.email,
+        user_id=user.id,
+        message="User profile updated",
     )
 
 
