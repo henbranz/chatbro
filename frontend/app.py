@@ -1721,6 +1721,17 @@ def typing_indicator_html(label: str = "Chat Bro is typing") -> str:
     )
 
 
+def typing_users_label(typing_users: list[dict[str, Any]]) -> str:
+    usernames = [str(user.get("username", "")).strip() for user in typing_users if user.get("username")]
+    if not usernames:
+        return ""
+    if len(usernames) == 1:
+        return f"{usernames[0]} is typing..."
+    if len(usernames) == 2:
+        return f"{usernames[0]} and {usernames[1]} are typing..."
+    return "Several users are typing..."
+
+
 def render_messages(
     messages: list[dict[str, Any]],
     current_user_id: int,
@@ -1747,9 +1758,9 @@ def render_group_messages(
     if show_bot_typing:
         message_items.append(typing_indicator_html("Chat Bro is typing"))
     if typing_users:
-        names = ", ".join(user["username"] for user in typing_users[:3])
-        verb = "are" if len(typing_users) > 1 else "is"
-        message_items.append(typing_indicator_html(f"{names} {verb} typing"))
+        user_typing_label = typing_users_label(typing_users)
+        if user_typing_label:
+            message_items.append(typing_indicator_html(user_typing_label))
     messages_html = "\n".join(reversed(message_items))
     st.markdown(
         f'<div class="messages"><div class="message-bottom-anchor"></div>{messages_html}</div>',
@@ -1879,6 +1890,9 @@ def render_group_typing_capture(user_id: int, group_id: int) -> None:
                     input.removeEventListener("keydown", onKeydown);
                     stopHeartbeat();
                 }};
+                if (input.value) {{
+                    onInput();
+                }}
             }};
 
             const findMessageInput = () => {{

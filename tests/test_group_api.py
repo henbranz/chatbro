@@ -102,6 +102,46 @@ class GroupChatApiTest(unittest.TestCase):
         typing_seen_by_member = api.get_group_typing_statuses(group.id, user_id=self.member.id, db=self.db)
         self.assertEqual(typing_seen_by_member, [])
 
+        with self.assertRaises(HTTPException) as outsider_typing:
+            api.get_group_typing_statuses(group.id, user_id=self.outsider.id, db=self.db)
+        self.assertEqual(outsider_typing.exception.status_code, 403)
+
+        other_group = api.create_group_chat(
+            api.GroupCreateRequest(user_id=self.owner.id, name="Other group"),
+            db=self.db,
+        )
+        self.assertEqual(api.get_group_typing_statuses(other_group.id, user_id=self.owner.id, db=self.db), [])
+
+        api.update_group_typing_status(
+            group.id,
+            api.GroupTypingRequest(user_id=self.member.id, is_typing=False),
+            db=self.db,
+        )
+        self.assertEqual(api.get_group_typing_statuses(group.id, user_id=self.owner.id, db=self.db), [])
+
+        api.update_group_typing_status(
+            group.id,
+            api.GroupTypingRequest(user_id=self.member.id, is_typing=True),
+            db=self.db,
+        )
+        expired_status = (
+            self.db.query(api.GroupTypingStatus)
+            .filter(api.GroupTypingStatus.group_id == group.id, api.GroupTypingStatus.user_id == self.member.id)
+            .first()
+        )
+        expired_status.updated_at = api.datetime.utcnow() - api.timedelta(
+            seconds=api.GROUP_TYPING_TIMEOUT_SECONDS + 1
+        )
+        self.db.commit()
+        self.assertEqual(api.get_group_typing_statuses(group.id, user_id=self.owner.id, db=self.db), [])
+        self.db.expire_all()
+
+        api.update_group_typing_status(
+            group.id,
+            api.GroupTypingRequest(user_id=self.member.id, is_typing=True),
+            db=self.db,
+        )
+
         with self.assertRaises(HTTPException) as outsider_read:
             api.get_group_messages(group.id, user_id=self.outsider.id, db=self.db)
         self.assertEqual(outsider_read.exception.status_code, 403)

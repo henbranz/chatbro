@@ -34,6 +34,7 @@ LEGACY_BOT_USERNAME = "simplebot"
 BOT_USERNAMES = {BOT_USERNAME, LEGACY_BOT_USERNAME}
 BOT_PASSWORD_HASH = "bot-account-cannot-login"
 PRODUCT_BOT_DISPLAY_NAME = "Chat Bro"
+GROUP_TYPING_TIMEOUT_SECONDS = 4
 
 
 def load_local_env_value(name: str) -> str:
@@ -1111,8 +1112,8 @@ def get_group_typing_statuses(
     group = get_group(db, group_id)
     require_group_member(db, group.id, user.id)
 
-    cutoff = datetime.utcnow() - timedelta(seconds=10)
-    db.query(GroupTypingStatus).filter(GroupTypingStatus.updated_at < cutoff).delete(synchronize_session=False)
+    cutoff = datetime.utcnow() - timedelta(seconds=GROUP_TYPING_TIMEOUT_SECONDS)
+    db.query(GroupTypingStatus).filter(GroupTypingStatus.updated_at < cutoff).delete(synchronize_session="fetch")
     statuses = (
         db.query(GroupTypingStatus)
         .join(User, User.id == GroupTypingStatus.user_id)
